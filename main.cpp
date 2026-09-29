@@ -9,11 +9,13 @@
 #define TAG "NativeGyro"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 
-static const float ALPHA = 0.4f; 
+// Drop ALPHA slightly to 0.30f to eat the microscopic grain without adding a rubber-band delay
+static const float ALPHA = 0.30f; 
 static float smoothed_gyro[3] = {0.0f, 0.0f, 0.0f};
 static int64_t last_timestamp = 0;
 static float last_pitch = 0.0f;
 static float last_roll = 0.0f;
+static float smooth_dt = 0.01f; // Used to stabilize timestamp jitter
 
 // Hook 1: Data Interceptor
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
@@ -38,11 +40,21 @@ void compute_gyro_from_accel(const float current_accel[3], int64_t timestamp, fl
         return;
     }
 
-    float dt = (timestamp - last_timestamp) / 1000000000.0f; 
-    if (dt <= 0.0f) return;
+    float raw_dt = (timestamp - last_timestamp) / 1000000000.0f; 
+    
+    // Safety clamp: If a massive lag spike happens, skip the frame so the crosshair doesn't teleport
+    if (raw_dt <= 0.0f || raw_dt > 0.1f) {
+        last_timestamp = timestamp;
+        return;
+    }
 
-    float delta_pitch = (pitch - last_pitch) / dt;
-    float delta_roll = (roll - last_roll) / dt;
+    // The Fix: Apply an Exponential Moving Average to the time delta itself.
+    // This forces the time division to be perfectly smooth, eliminating the grainy stepping.
+    smooth_dt = 0.10f * raw_dt + 0.90f * smooth_dt;
+
+    // Calculate speed using the stabilized timestamp
+    float delta_pitch = (pitch - last_pitch) / smooth_dt;
+    float delta_roll = (roll - last_roll) / smooth_dt;
 
     smoothed_gyro[0] = ALPHA * delta_pitch + (1.0f - ALPHA) * smoothed_gyro[0];
     smoothed_gyro[1] = ALPHA * delta_roll + (1.0f - ALPHA) * smoothed_gyro[1];
