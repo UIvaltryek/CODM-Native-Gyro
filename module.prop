@@ -2,5 +2,5 @@ id=native_virtual_gyro
 name=Zero-Delay Native Gyro
 version=v1.0
 versionCode=1
-author=Slam
+author=UIvaltryek
 description=C++ Zygisk hook intercepting the CODM native sensor queue.
