@@ -62,10 +62,11 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
             if (events[i].type == ASENSOR_TYPE_ACCELEROMETER) {
                 float synthetic[3];
                 compute_gyro_from_accel(events[i].acceleration.v, events[i].timestamp, synthetic);
-            } else if (events[i].type == ASENSOR_TYPE_GYROSCOPE) {
-                // Landscape Mode Axis Remapping
-                events[i].vector.x = smoothed_gyro[1]; // Feed Y into X
-                events[i].vector.y = smoothed_gyro[0]; // Feed X into Y
+                        } else if (events[i].type == ASENSOR_TYPE_GYROSCOPE) {
+                // FIXED: The atan2 trigonometry inherently swapped the hardware axes, 
+                // so we map 0 to X and 1 to Y directly.
+                events[i].vector.x = smoothed_gyro[0]; 
+                events[i].vector.y = smoothed_gyro[1]; 
                 events[i].vector.z = smoothed_gyro[2];
             }
         }
