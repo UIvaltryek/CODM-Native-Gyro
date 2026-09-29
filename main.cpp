@@ -9,21 +9,23 @@
 #define TAG "NativeGyro"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 
-static const float ALPHA = 0.90f; 
-
-// Increased threshold to aggressively kill resting drift (0.030f rad/s)
-static const float STATIONARY_THRESHOLD = 0.030f; 
+// Reverted to base filter
+static const float ALPHA = 0.25f; 
 
 static float smoothed_gyro[3] = {0.0f, 0.0f, 0.0f};
 static int64_t last_timestamp = 0;
 static float last_pitch = 0.0f;
 static float last_roll = 0.0f;
 
+// DRIFT ELIMINATOR: Tracks continuous hardware offset
+static float pitch_bias = 0.0f;
+static float roll_bias = 0.0f;
+
 // Hook 1: Data Interceptor
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
 static getEvents_t orig_getEvents = nullptr;
 
-// Hook 2: Speed Controller
+// Hook 2: Speed Controller (Keeps high polling rate)
 typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
 static setEventRate_t orig_setEventRate = nullptr;
 
@@ -42,7 +44,7 @@ void compute_gyro_from_accel(const float current_accel[3], int64_t timestamp, fl
         return;
     }
 
-    // Using raw time delta directly; moving average removed
+    // Direct raw time delta
     float raw_dt = (timestamp - last_timestamp) / 1000000000.0f; 
     
     if (raw_dt <= 0.0f || raw_dt > 0.1f) {
@@ -53,10 +55,17 @@ void compute_gyro_from_accel(const float current_accel[3], int64_t timestamp, fl
     float delta_pitch = (pitch - last_pitch) / raw_dt;
     float delta_roll = (roll - last_roll) / raw_dt;
 
-    // STATIONARY NOISE GATE
-    if (fabs(delta_pitch) < STATIONARY_THRESHOLD) delta_pitch = 0.0f;
-    if (fabs(delta_roll) < STATIONARY_THRESHOLD) delta_roll = 0.0f;
+    // --- DRIFT ELIMINATOR (High-Pass Filter DC Blocker) ---
+    // A 0.05% moving average slowly finds the hardware's exact resting pull over time
+    pitch_bias = 0.0005f * delta_pitch + 0.9995f * pitch_bias;
+    roll_bias = 0.0005f * delta_roll + 0.9995f * roll_bias;
 
+    // Subtract the resting pull from the raw movement to perfectly center the axis
+    delta_pitch -= pitch_bias;
+    delta_roll -= roll_bias;
+    // -------------------------------------------------------
+
+    // Apply 0.25f EMA filter for smoothness
     smoothed_gyro[0] = ALPHA * delta_pitch + (1.0f - ALPHA) * smoothed_gyro[0];
     smoothed_gyro[1] = ALPHA * delta_roll + (1.0f - ALPHA) * smoothed_gyro[1];
     smoothed_gyro[2] = 0.0f; 
