@@ -53,11 +53,14 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
             if (events[i].type == ASENSOR_TYPE_ACCELEROMETER) {
                 float synthetic[3];
                 compute_gyro_from_accel(events[i].acceleration.v, events[i].timestamp, synthetic);
-            } else if (events[i].type == ASENSOR_TYPE_GYROSCOPE) {
-                events[i].vector.x = smoothed_gyro[0];
-                events[i].vector.y = smoothed_gyro[1];
+                        } else if (events[i].type == ASENSOR_TYPE_GYROSCOPE) {
+                // Landscape Mode Axis Remapping
+                // Swap the physical axes to match the game's rotated screen
+                events[i].vector.x = smoothed_gyro[1]; // Feed Y into X
+                events[i].vector.y = smoothed_gyro[0]; // Feed X into Y
                 events[i].vector.z = smoothed_gyro[2];
             }
+
         }
     }
     return actual_events;
