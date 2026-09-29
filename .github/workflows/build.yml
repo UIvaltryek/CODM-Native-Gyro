@@ -21,13 +21,10 @@ jobs:
 
     - name: Build with CMake
       run: |
-        # 1. Download official Dobby manually
-        git clone https://github.com/jmpews/Dobby.git
+        # Download the LSPosed team's Android-optimized Dobby fork
+        git clone https://github.com/LSPosed/Dobby.git
         
-        # 2. Inject the C-preprocessor fix directly into Dobby's own code
-        echo 'set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -x assembler-with-cpp -D__ANDROID__=1")' | cat - Dobby/CMakeLists.txt > temp && mv temp Dobby/CMakeLists.txt
-        
-        # 3. Build the project (Forcing static libraries so Dobby is merged into our .so)
+        # Build the project
         mkdir build && cd build
         cmake -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
               -DANDROID_ABI=arm64-v8a \
