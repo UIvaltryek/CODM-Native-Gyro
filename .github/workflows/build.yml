@@ -19,7 +19,7 @@ jobs:
     - name: Download Zygisk Header
       run: curl -o zygisk.hpp https://raw.githubusercontent.com/topjohnwu/zygisk-module-sample/master/module/jni/zygisk.hpp
 
-        - name: Build with CMake
+    - name: Build with CMake
       run: |
         mkdir -p build && cd build
         cmake -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
