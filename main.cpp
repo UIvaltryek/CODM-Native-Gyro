@@ -9,13 +9,17 @@
 #define TAG "NativeGyro"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 
-// Drop ALPHA slightly to 0.30f to eat the microscopic grain without adding a rubber-band delay
-static const float ALPHA = 0.30f; 
+// 1. High responsiveness (No rubber-banding delay)
+static const float ALPHA = 0.90f; 
+
+// 2. The Noise Gate: Movements slower than this (rad/s) are clamped to zero to kill resting jitter.
+static const float STATIONARY_THRESHOLD = 0.015f; 
+
 static float smoothed_gyro[3] = {0.0f, 0.0f, 0.0f};
 static int64_t last_timestamp = 0;
 static float last_pitch = 0.0f;
 static float last_roll = 0.0f;
-static float smooth_dt = 0.01f; // Used to stabilize timestamp jitter
+static float smooth_dt = 0.01f; 
 
 // Hook 1: Data Interceptor
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
@@ -30,6 +34,7 @@ void compute_gyro_from_accel(const float current_accel[3], int64_t timestamp, fl
     float y = current_accel[1];
     float z = current_accel[2];
 
+    // Calculate true absolute angles using the gravity vector
     float pitch = atan2(y, sqrt(x*x + z*z)); 
     float roll = atan2(-x, z); 
 
@@ -42,23 +47,27 @@ void compute_gyro_from_accel(const float current_accel[3], int64_t timestamp, fl
 
     float raw_dt = (timestamp - last_timestamp) / 1000000000.0f; 
     
-    // Safety clamp: If a massive lag spike happens, skip the frame so the crosshair doesn't teleport
+    // Safety clamp: Skip massive lag spikes so the crosshair doesn't teleport
     if (raw_dt <= 0.0f || raw_dt > 0.1f) {
         last_timestamp = timestamp;
         return;
     }
 
-    // The Fix: Apply an Exponential Moving Average to the time delta itself.
-    // This forces the time division to be perfectly smooth, eliminating the grainy stepping.
+    // Apply an Exponential Moving Average to the time delta itself to fix grainy stepping
     smooth_dt = 0.10f * raw_dt + 0.90f * smooth_dt;
 
-    // Calculate speed using the stabilized timestamp
     float delta_pitch = (pitch - last_pitch) / smooth_dt;
     float delta_roll = (roll - last_roll) / smooth_dt;
 
+    // STATIONARY NOISE GATE
+    // If the movement is below the threshold, clamp the raw velocity to zero
+    if (fabs(delta_pitch) < STATIONARY_THRESHOLD) delta_pitch = 0.0f;
+    if (fabs(delta_roll) < STATIONARY_THRESHOLD) delta_roll = 0.0f;
+
+    // Apply Heavy Exponential Moving Average to calculate final speed
     smoothed_gyro[0] = ALPHA * delta_pitch + (1.0f - ALPHA) * smoothed_gyro[0];
     smoothed_gyro[1] = ALPHA * delta_roll + (1.0f - ALPHA) * smoothed_gyro[1];
-    smoothed_gyro[2] = 0.0f; 
+    smoothed_gyro[2] = 0.0f; // Z-axis twist cannot be derived from gravity
 
     out_gyro[0] = smoothed_gyro[0];
     out_gyro[1] = smoothed_gyro[1];
@@ -77,6 +86,7 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                 float synthetic[3];
                 compute_gyro_from_accel(events[i].acceleration.v, events[i].timestamp, synthetic);
             } else if (events[i].type == ASENSOR_TYPE_GYROSCOPE) {
+                // Landscape Mode Axis Remapping (Variables uncrossed, direct mapping)
                 events[i].vector.x = smoothed_gyro[0]; 
                 events[i].vector.y = smoothed_gyro[1]; 
                 events[i].vector.z = smoothed_gyro[2];
@@ -100,6 +110,7 @@ void install_hook() {
             DobbyHook(target_get, 
                      (dobby_dummy_func_t)hook_ASensorEventQueue_getEvents, 
                      (dobby_dummy_func_t*)&orig_getEvents);
+            LOGI("ASensorEventQueue_getEvents hooked");
         }
         
         // Install Speed Controller
@@ -108,6 +119,7 @@ void install_hook() {
             DobbyHook(target_rate, 
                      (dobby_dummy_func_t)hook_ASensorEventQueue_setEventRate, 
                      (dobby_dummy_func_t*)&orig_setEventRate);
+            LOGI("ASensorEventQueue_setEventRate hooked");
         }
     }
 }
