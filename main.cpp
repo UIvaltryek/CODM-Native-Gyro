@@ -10,7 +10,7 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 
 // The new variables (no duplicates)
-static const float ALPHA = 0.15f; 
+static const float ALPHA = 0.45f; 
 static float smoothed_gyro[3] = {0.0f, 0.0f, 0.0f};
 static int64_t last_timestamp = 0;
 static float last_pitch = 0.0f;
