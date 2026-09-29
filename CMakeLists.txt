@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.22)
 project(native_gyro)
 
+# BUGFIX: Force Clang to run the C preprocessor on assembly files.
+# This stops it from accidentally trying to compile Apple/iOS syntax on Android.
+set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -x assembler-with-cpp -D__linux__=1 -D__ANDROID__=1")
+
 # Automatically download and configure the Dobby hooking library
 include(FetchContent)
 FetchContent_Declare(
