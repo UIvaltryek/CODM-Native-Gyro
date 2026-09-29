@@ -2,29 +2,32 @@
 #include <android/log.h>
 #include <dlfcn.h>
 #include <string.h>
-#include <math.h> // Required for atan2 and sqrt
+#include <math.h> 
 #include "dobby.h"
 #include "zygisk.hpp"
 
 #define TAG "NativeGyro"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 
-// The new variables (no duplicates)
 static const float ALPHA = 0.45f; 
 static float smoothed_gyro[3] = {0.0f, 0.0f, 0.0f};
 static int64_t last_timestamp = 0;
 static float last_pitch = 0.0f;
 static float last_roll = 0.0f;
 
+// Hook 1: Data Interceptor
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
 static getEvents_t orig_getEvents = nullptr;
+
+// Hook 2: Speed Controller
+typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
+static setEventRate_t orig_setEventRate = nullptr;
 
 void compute_gyro_from_accel(const float current_accel[3], int64_t timestamp, float out_gyro[3]) {
     float x = current_accel[0];
     float y = current_accel[1];
     float z = current_accel[2];
 
-    // True Angular Velocity (Rads/sec) using gravity vectors
     float pitch = atan2(y, sqrt(x*x + z*z)); 
     float roll = atan2(-x, z); 
 
@@ -41,7 +44,6 @@ void compute_gyro_from_accel(const float current_accel[3], int64_t timestamp, fl
     float delta_pitch = (pitch - last_pitch) / dt;
     float delta_roll = (roll - last_roll) / dt;
 
-    // Apply Heavy Exponential Moving Average to kill screen-tapping jitter
     smoothed_gyro[0] = ALPHA * delta_pitch + (1.0f - ALPHA) * smoothed_gyro[0];
     smoothed_gyro[1] = ALPHA * delta_roll + (1.0f - ALPHA) * smoothed_gyro[1];
     smoothed_gyro[2] = 0.0f; 
@@ -62,9 +64,7 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
             if (events[i].type == ASENSOR_TYPE_ACCELEROMETER) {
                 float synthetic[3];
                 compute_gyro_from_accel(events[i].acceleration.v, events[i].timestamp, synthetic);
-                        } else if (events[i].type == ASENSOR_TYPE_GYROSCOPE) {
-                // FIXED: The atan2 trigonometry inherently swapped the hardware axes, 
-                // so we map 0 to X and 1 to Y directly.
+            } else if (events[i].type == ASENSOR_TYPE_GYROSCOPE) {
                 events[i].vector.x = smoothed_gyro[0]; 
                 events[i].vector.y = smoothed_gyro[1]; 
                 events[i].vector.z = smoothed_gyro[2];
@@ -74,15 +74,28 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
     return actual_events;
 }
 
+int hook_ASensorEventQueue_setEventRate(ASensorEventQueue* queue, ASensor const* sensor, int32_t usec) {
+    // Force CODM's requested delay to 0 microseconds (absolute fastest limit)
+    return orig_setEventRate(queue, sensor, 0);
+}
+
 void install_hook() {
     void* libandroid = dlopen("libandroid.so", RTLD_NOW);
     if (libandroid) {
-        void* target = dlsym(libandroid, "ASensorEventQueue_getEvents");
-        if (target) {
-            DobbyHook(target, 
+        // Install Data Interceptor
+        void* target_get = dlsym(libandroid, "ASensorEventQueue_getEvents");
+        if (target_get) {
+            DobbyHook(target_get, 
                      (dobby_dummy_func_t)hook_ASensorEventQueue_getEvents, 
                      (dobby_dummy_func_t*)&orig_getEvents);
-            LOGI("ASensorEventQueue_getEvents successfully hooked");
+        }
+        
+        // Install Speed Controller
+        void* target_rate = dlsym(libandroid, "ASensorEventQueue_setEventRate");
+        if (target_rate) {
+            DobbyHook(target_rate, 
+                     (dobby_dummy_func_t)hook_ASensorEventQueue_setEventRate, 
+                     (dobby_dummy_func_t*)&orig_setEventRate);
         }
     }
 }
