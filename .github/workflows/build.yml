@@ -1,0 +1,43 @@
+name: Build Native Module
+
+on:
+  push:
+    branches: [ "main", "master" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Setup Android NDK
+      uses: nttld/setup-ndk@v1
+      with:
+        ndk-version: r26b
+
+    - name: Download Zygisk Header
+      run: curl -o zygisk.hpp https://raw.githubusercontent.com/topjohnwu/zygisk-module-sample/master/module/jni/zygisk.hpp
+
+    - name: Build with CMake
+      run: |
+        mkdir build && cd build
+        cmake -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+              -DANDROID_ABI=arm64-v8a \
+              -DANDROID_PLATFORM=android-29 \
+              ..
+        make
+
+    - name: Package Magisk Module
+      run: |
+        mkdir -p package/zygisk
+        cp build/libnative_gyro.so package/zygisk/arm64-v8a.so
+        cp module.prop package/
+        cd package && zip -r ../Native-Gyro.zip .
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Native-Gyro-Module
+        path: package/Native-Gyro.zip
+        
