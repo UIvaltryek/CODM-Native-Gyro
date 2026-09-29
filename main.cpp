@@ -16,33 +16,50 @@ static int64_t last_timestamp = 0;
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
 static getEvents_t orig_getEvents = nullptr;
 
+#include <math.h> // Required for atan2 and sqrt
+
+// Lowering ALPHA to 0.15f (15% raw, 85% history) eliminates the high-frequency jitter
+static const float ALPHA = 0.15f; 
+static float smoothed_gyro[3] = {0.0f, 0.0f, 0.0f};
+static int64_t last_timestamp = 0;
+static float last_pitch = 0.0f;
+static float last_roll = 0.0f;
+
 void compute_gyro_from_accel(const float current_accel[3], int64_t timestamp, float out_gyro[3]) {
+    // Calculate true absolute angles using the gravity vector
+    float x = current_accel[0];
+    float y = current_accel[1];
+    float z = current_accel[2];
+
+    // atan2 converts the 3D gravity projection into precise rotational radians
+    float pitch = atan2(y, sqrt(x*x + z*z)); 
+    float roll = atan2(-x, z); 
+
     if (last_timestamp == 0) {
         last_timestamp = timestamp;
-        last_accel[0] = current_accel[0];
-        last_accel[1] = current_accel[1];
-        last_accel[2] = current_accel[2];
+        last_pitch = pitch;
+        last_roll = roll;
         return;
     }
 
     float dt = (timestamp - last_timestamp) / 1000000000.0f; 
     if (dt <= 0.0f) return;
 
-    float delta_x = (current_accel[0] - last_accel[0]) / dt;
-    float delta_y = (current_accel[1] - last_accel[1]) / dt;
-    float delta_z = (current_accel[2] - last_accel[2]) / dt;
+    // True Angular Velocity (Rads/sec)
+    float delta_pitch = (pitch - last_pitch) / dt;
+    float delta_roll = (roll - last_roll) / dt;
 
-    smoothed_gyro[0] = ALPHA * delta_x + (1.0f - ALPHA) * smoothed_gyro[0];
-    smoothed_gyro[1] = ALPHA * delta_y + (1.0f - ALPHA) * smoothed_gyro[1];
-    smoothed_gyro[2] = ALPHA * delta_z + (1.0f - ALPHA) * smoothed_gyro[2];
+    // Apply Heavy Exponential Moving Average to kill screen-tapping jitter
+    smoothed_gyro[0] = ALPHA * delta_pitch + (1.0f - ALPHA) * smoothed_gyro[0];
+    smoothed_gyro[1] = ALPHA * delta_roll + (1.0f - ALPHA) * smoothed_gyro[1];
+    smoothed_gyro[2] = 0.0f; // Z-axis twist cannot be derived from gravity
 
     out_gyro[0] = smoothed_gyro[0];
     out_gyro[1] = smoothed_gyro[1];
     out_gyro[2] = smoothed_gyro[2];
 
-    last_accel[0] = current_accel[0];
-    last_accel[1] = current_accel[1];
-    last_accel[2] = current_accel[2];
+    last_pitch = pitch;
+    last_roll = roll;
     last_timestamp = timestamp;
 }
 
