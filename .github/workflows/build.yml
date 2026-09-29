@@ -44,4 +44,4 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: Native-Gyro-Module
-        path: package/Native-Gyro.zip
+        path: Native-Gyro.zip
