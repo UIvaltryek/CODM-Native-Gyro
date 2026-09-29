@@ -68,7 +68,10 @@ void install_hook() {
     if (libandroid) {
         void* target = dlsym(libandroid, "ASensorEventQueue_getEvents");
         if (target) {
-            DobbyHook(target, (void*)hook_ASensorEventQueue_getEvents, (void**)&orig_getEvents);
+            // FIX: Updated casting to match LSPosed Dobby's strict dobby_dummy_func_t requirement
+            DobbyHook(target, 
+                     (dobby_dummy_func_t)hook_ASensorEventQueue_getEvents, 
+                     (dobby_dummy_func_t*)&orig_getEvents);
             LOGI("ASensorEventQueue_getEvents successfully hooked");
         }
     }
