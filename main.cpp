@@ -9,7 +9,8 @@
 #define TAG "NativeGyro"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 
-static const float ALPHA_ACCEL = 0.5f; 
+// Filter significantly lowered for hyper-responsiveness (65% instant raw input)
+static const float ALPHA_ACCEL = 0.65f; 
 static const float MAG_NOISE_GATE = 0.015f;
 
 static float smoothed_gyro[3] = {0.0f, 0.0f, 0.0f};
@@ -48,9 +49,10 @@ void compute_sensor_fusion(int64_t timestamp) {
     float gy = ay / G;
     float gz = az / G;
 
-    // THE FIX 1: atan2(ay, az) allows full 360-degree vertical tilt without bouncing at 90 degrees
+    // Pitch: allows full 360-degree vertical tilt
     float pitch = atan2(ay, az); 
     
+    // Roll: X-axis isolated from Z-axis to prevent cross-talk bleed
     float normalized_ax = -ax / G;
     if (normalized_ax > 1.0f) normalized_ax = 1.0f;
     if (normalized_ax < -1.0f) normalized_ax = -1.0f;
@@ -104,8 +106,6 @@ void compute_sensor_fusion(int64_t timestamp) {
     // 3. DYNAMIC CROSSFADE
     float fade_factor = pow(fabs(sin(pitch)), 4.0f);
     float final_horizontal_speed = (speed_roll * (1.0f - fade_factor)) + (speed_yaw * fade_factor);
-
-    // THE FIX 2: Drift Eliminators completely removed. No more rubber-banding.
 
     // 4. Output to Game
     smoothed_gyro[0] = ALPHA_ACCEL * speed_pitch + (1.0f - ALPHA_ACCEL) * smoothed_gyro[0];
