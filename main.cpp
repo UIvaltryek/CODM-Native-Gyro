@@ -10,12 +10,12 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 
 // Accelerometer filter (Fast - 200Hz)
-static const float ALPHA_ACCEL = 0.25f; 
-// Magnetometer filter (Upgraded to match 100Hz hardware capability)
-static const float ALPHA_MAG = 0.20f; 
+static const float ALPHA_ACCEL = 0.4f; 
+// Magnetometer filter (100Hz hardware capability)
+static const float ALPHA_MAG = 0.4f; 
 
-// Dedicated noise gate to block magnetic static without causing delay
-static const float MAG_NOISE_GATE = 0.025f;
+// Slightly lowered noise gate for smoother micro-adjustments
+static const float MAG_NOISE_GATE = 0.015f;
 
 static float smoothed_gyro[3] = {0.0f, 0.0f, 0.0f};
 
@@ -50,7 +50,7 @@ void compute_sensor_fusion(int64_t timestamp) {
     float my = last_mag[1];
     float mz = last_mag[2];
 
-    // 1. Calculate Gravity and Pitch/Roll (Immune to horizontal bleed)
+    // 1. Calculate Gravity and Pitch/Roll
     float G = sqrt(ax*ax + ay*ay + az*az);
     if (G < 0.1f) G = 0.1f; 
 
@@ -93,7 +93,7 @@ void compute_sensor_fusion(int64_t timestamp) {
     float speed_roll = delta_roll / raw_dt;
     float speed_yaw = delta_yaw / raw_dt;
 
-    // 4. Magnetic Noise Gate (Clamps room static to absolute zero)
+    // 4. Magnetic Noise Gate 
     if (fabs(speed_yaw) < MAG_NOISE_GATE) speed_yaw = 0.0f;
 
     // 5. Drift Eliminators (High-Pass Filters)
@@ -105,10 +105,15 @@ void compute_sensor_fusion(int64_t timestamp) {
     speed_roll -= roll_bias;
     speed_yaw -= yaw_bias;
 
-    // 6. Apply Split Filters for 200Hz Accel and 100Hz Mag
+    // 6. CORRECTED AXIS MAPPING
+    // X-Axis = Pitch (Looking Up/Down from Gravity)
     smoothed_gyro[0] = ALPHA_ACCEL * speed_pitch + (1.0f - ALPHA_ACCEL) * smoothed_gyro[0];
-    smoothed_gyro[1] = ALPHA_ACCEL * speed_roll + (1.0f - ALPHA_ACCEL) * smoothed_gyro[1];
-    smoothed_gyro[2] = ALPHA_MAG * speed_yaw + (1.0f - ALPHA_MAG) * smoothed_gyro[2];
+    
+    // Y-Axis = Yaw (Looking Left/Right from Compass!)
+    smoothed_gyro[1] = ALPHA_MAG * speed_yaw + (1.0f - ALPHA_MAG) * smoothed_gyro[1];
+    
+    // Z-Axis = Roll (Steering Wheel tilt from Gravity)
+    smoothed_gyro[2] = ALPHA_ACCEL * speed_roll + (1.0f - ALPHA_ACCEL) * smoothed_gyro[2];
 
     last_pitch = pitch;
     last_roll = roll;
@@ -138,6 +143,7 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                 fusion_needed = true;
             } 
             else if (events[i].type == ASENSOR_TYPE_GYROSCOPE) {
+                // Vector mapping matches the smoothed_gyro arrays directly
                 events[i].vector.x = smoothed_gyro[0]; 
                 events[i].vector.y = smoothed_gyro[1]; 
                 events[i].vector.z = smoothed_gyro[2]; 
