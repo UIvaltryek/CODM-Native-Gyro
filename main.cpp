@@ -9,16 +9,29 @@
 #define TAG "NativeGyro"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 
-static const float ALPHA = 0.25f; 
+// Accelerometer filter (Fast - 200Hz)
+static const float ALPHA_ACCEL = 0.25f; 
+// Magnetometer filter (Upgraded to match 100Hz hardware capability)
+static const float ALPHA_MAG = 0.20f; 
+
+// Dedicated noise gate to block magnetic static without causing delay
+static const float MAG_NOISE_GATE = 0.025f;
 
 static float smoothed_gyro[3] = {0.0f, 0.0f, 0.0f};
+
+// Sensor States
+static float last_accel[3] = {0.0f, 0.0f, 9.81f};
+static float last_mag[3] = {0.0f, 1.0f, 0.0f};
 static int64_t last_timestamp = 0;
+
 static float last_pitch = 0.0f;
 static float last_roll = 0.0f;
+static float last_yaw = 0.0f;
 
-// DRIFT ELIMINATOR
+// Drift Eliminators
 static float pitch_bias = 0.0f;
 static float roll_bias = 0.0f;
+static float yaw_bias = 0.0f;
 
 // Hook 1: Data Interceptor
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
@@ -28,83 +41,111 @@ static getEvents_t orig_getEvents = nullptr;
 typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
 static setEventRate_t orig_setEventRate = nullptr;
 
-void compute_gyro_from_accel(const float current_accel[3], int64_t timestamp, float out_gyro[3]) {
-    float x = current_accel[0];
-    float y = current_accel[1];
-    float z = current_accel[2];
+void compute_sensor_fusion(int64_t timestamp) {
+    float ax = last_accel[0];
+    float ay = last_accel[1];
+    float az = last_accel[2];
 
-    // Calculate total gravity magnitude to decouple the axes
-    float G = sqrt(x*x + y*y + z*z);
-    if (G < 0.1f) G = 0.1f; // Safety clamp to prevent division by zero
+    float mx = last_mag[0];
+    float my = last_mag[1];
+    float mz = last_mag[2];
 
-    // Pitch is strictly calculated from Y and Z (immune to horizontal cross-talk)
-    float pitch = atan2(y, sqrt(x*x + z*z)); 
+    // 1. Calculate Gravity and Pitch/Roll (Immune to horizontal bleed)
+    float G = sqrt(ax*ax + ay*ay + az*az);
+    if (G < 0.1f) G = 0.1f; 
 
-    // THE FIX: Horizontal Roll is strictly calculated from X and total gravity.
-    // Pitching the phone up and down will no longer cause horizontal crosshair bleed.
-    float normalized_x = -x / G;
-    if (normalized_x > 1.0f) normalized_x = 1.0f;
-    if (normalized_x < -1.0f) normalized_x = -1.0f;
-    float roll = asin(normalized_x); 
+    float pitch = atan2(ay, sqrt(ax*ax + az*az)); 
+    
+    float normalized_ax = -ax / G;
+    if (normalized_ax > 1.0f) normalized_ax = 1.0f;
+    if (normalized_ax < -1.0f) normalized_ax = -1.0f;
+    float roll = asin(normalized_ax); 
+
+    // 2. Tilt-Compensated Magnetometer (Yaw)
+    float my_comp = my * cos(roll) - mz * sin(roll);
+    float mx_comp = mx * cos(pitch) + my * sin(pitch) * sin(roll) + mz * sin(pitch) * cos(roll);
+    float yaw = atan2(my_comp, mx_comp);
 
     if (last_timestamp == 0) {
         last_timestamp = timestamp;
         last_pitch = pitch;
         last_roll = roll;
+        last_yaw = yaw;
         return;
     }
 
     float raw_dt = (timestamp - last_timestamp) / 1000000000.0f; 
-    
     if (raw_dt <= 0.0f || raw_dt > 0.1f) {
         last_timestamp = timestamp;
         return;
     }
 
-    float delta_pitch = (pitch - last_pitch) / raw_dt;
-    float delta_roll = (roll - last_roll) / raw_dt;
+    float delta_pitch = (pitch - last_pitch);
+    float delta_roll = (roll - last_roll);
+    float delta_yaw = (yaw - last_yaw);
 
-    // --- DYNAMIC HORIZONTAL COMPENSATION ---
-    // Automatically boosts horizontal sensitivity as the phone is tilted upright.
-    // Clamped at 0.15f (approx 81 degrees) to prevent math from exploding at exactly 90 degrees.
-    float pitch_cos = fmax(fabs(cos(pitch)), 0.15f); 
-    delta_roll = delta_roll / pitch_cos;
-    // ---------------------------------------
+    // 3. Pi-Wrap Correction 
+    if (delta_yaw > M_PI) delta_yaw -= 2.0f * M_PI;
+    if (delta_yaw < -M_PI) delta_yaw += 2.0f * M_PI;
 
-    // --- DRIFT ELIMINATOR ---
-    pitch_bias = 0.0005f * delta_pitch + 0.9995f * pitch_bias;
-    roll_bias = 0.0005f * delta_roll + 0.9995f * roll_bias;
+    // Convert to speeds (rad/s)
+    float speed_pitch = delta_pitch / raw_dt;
+    float speed_roll = delta_roll / raw_dt;
+    float speed_yaw = delta_yaw / raw_dt;
 
-    delta_pitch -= pitch_bias;
-    delta_roll -= roll_bias;
-    // ------------------------
+    // 4. Magnetic Noise Gate (Clamps room static to absolute zero)
+    if (fabs(speed_yaw) < MAG_NOISE_GATE) speed_yaw = 0.0f;
 
-    // Apply EMA filter
-    smoothed_gyro[0] = ALPHA * delta_pitch + (1.0f - ALPHA) * smoothed_gyro[0];
-    smoothed_gyro[1] = ALPHA * delta_roll + (1.0f - ALPHA) * smoothed_gyro[1];
-    smoothed_gyro[2] = 0.0f; 
+    // 5. Drift Eliminators (High-Pass Filters)
+    pitch_bias = 0.0005f * speed_pitch + 0.9995f * pitch_bias;
+    roll_bias = 0.0005f * speed_roll + 0.9995f * roll_bias;
+    yaw_bias = 0.0005f * speed_yaw + 0.9995f * yaw_bias;
 
-    out_gyro[0] = smoothed_gyro[0];
-    out_gyro[1] = smoothed_gyro[1];
-    out_gyro[2] = smoothed_gyro[2];
+    speed_pitch -= pitch_bias;
+    speed_roll -= roll_bias;
+    speed_yaw -= yaw_bias;
+
+    // 6. Apply Split Filters for 200Hz Accel and 100Hz Mag
+    smoothed_gyro[0] = ALPHA_ACCEL * speed_pitch + (1.0f - ALPHA_ACCEL) * smoothed_gyro[0];
+    smoothed_gyro[1] = ALPHA_ACCEL * speed_roll + (1.0f - ALPHA_ACCEL) * smoothed_gyro[1];
+    smoothed_gyro[2] = ALPHA_MAG * speed_yaw + (1.0f - ALPHA_MAG) * smoothed_gyro[2];
 
     last_pitch = pitch;
     last_roll = roll;
+    last_yaw = yaw;
     last_timestamp = timestamp;
 }
 
 ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent* events, size_t count) {
     ssize_t actual_events = orig_getEvents(queue, events, count);
     if (actual_events > 0) {
+        bool fusion_needed = false;
+        int64_t latest_ts = 0;
+
         for (ssize_t i = 0; i < actual_events; i++) {
             if (events[i].type == ASENSOR_TYPE_ACCELEROMETER) {
-                float synthetic[3];
-                compute_gyro_from_accel(events[i].acceleration.v, events[i].timestamp, synthetic);
-            } else if (events[i].type == ASENSOR_TYPE_GYROSCOPE) {
+                last_accel[0] = events[i].acceleration.v[0];
+                last_accel[1] = events[i].acceleration.v[1];
+                last_accel[2] = events[i].acceleration.v[2];
+                latest_ts = events[i].timestamp;
+                fusion_needed = true;
+            } 
+            else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD) {
+                last_mag[0] = events[i].magnetic.v[0];
+                last_mag[1] = events[i].magnetic.v[1];
+                last_mag[2] = events[i].magnetic.v[2];
+                latest_ts = events[i].timestamp;
+                fusion_needed = true;
+            } 
+            else if (events[i].type == ASENSOR_TYPE_GYROSCOPE) {
                 events[i].vector.x = smoothed_gyro[0]; 
                 events[i].vector.y = smoothed_gyro[1]; 
-                events[i].vector.z = smoothed_gyro[2];
+                events[i].vector.z = smoothed_gyro[2]; 
             }
+        }
+
+        if (fusion_needed && latest_ts > 0) {
+            compute_sensor_fusion(latest_ts);
         }
     }
     return actual_events;
