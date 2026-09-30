@@ -11,7 +11,7 @@
 
 // Filter significantly lowered for hyper-responsiveness (65% instant raw input)
 static const float ALPHA_ACCEL = 0.65f; 
-static const float MAG_NOISE_GATE = 0.005f;
+static const float MAG_NOISE_GATE = 0.01f;
 
 static float smoothed_gyro[3] = {0.0f, 0.0f, 0.0f};
 
