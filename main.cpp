@@ -5,9 +5,9 @@
 #include "dobby.h"
 #include "zygisk.hpp"
 
-// Production Build: All logging removed for maximum I/O performance
+// Production Build: All logging removed, stutter timestamp fix applied
 static const float ALPHA_ACCEL = 0.65f; 
-static const float MAG_NOISE_GATE = 0.015f;
+static const float MAG_NOISE_GATE = 0.01f; 
 
 static float smoothed_gyro[3] = {0.0f, 0.0f, 0.0f};
 
@@ -107,14 +107,20 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                 last_accel[0] = events[i].acceleration.v[0];
                 last_accel[1] = events[i].acceleration.v[1];
                 last_accel[2] = events[i].acceleration.v[2];
-                latest_ts = events[i].timestamp;
+                // Time-travel stutter fix
+                if (events[i].timestamp > latest_ts) {
+                    latest_ts = events[i].timestamp;
+                }
                 fusion_needed = true;
             } 
             else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD) {
                 last_mag[0] = events[i].magnetic.v[0];
                 last_mag[1] = events[i].magnetic.v[1];
                 last_mag[2] = events[i].magnetic.v[2];
-                latest_ts = events[i].timestamp;
+                // Time-travel stutter fix
+                if (events[i].timestamp > latest_ts) {
+                    latest_ts = events[i].timestamp;
+                }
                 fusion_needed = true;
             } 
             else if (events[i].type == ASENSOR_TYPE_GYROSCOPE) {
@@ -131,7 +137,7 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
     return actual_events;
 }
 
-// Universal speed uncap hook (Acts as a safety net for native C++ games)
+// Universal speed uncap hook (Safety net for pure native C++ engines)
 int hook_ASensorEventQueue_setEventRate(ASensorEventQueue* queue, ASensor const* sensor, int32_t usec) {
     return orig_setEventRate(queue, sensor, 0); 
 }
