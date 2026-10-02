@@ -113,16 +113,19 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                 }
                 fusion_needed = true;
             } 
-            else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD) {
-                last_mag[0] = events[i].magnetic.v[0];
-                last_mag[1] = events[i].magnetic.v[1];
-                last_mag[2] = events[i].magnetic.v[2];
+            else if (events[i].type == 14) { // 14 = ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED
+                
+                // Using .data[] array bypasses NDK versioning errors for uncalibrated struct names
+                last_mag[0] = events[i].data[0]; 
+                last_mag[1] = events[i].data[1]; 
+                last_mag[2] = events[i].data[2]; 
+                
                 // Time-travel stutter fix
                 if (events[i].timestamp > latest_ts) {
                     latest_ts = events[i].timestamp;
                 }
                 fusion_needed = true;
-            } 
+            }
             else if (events[i].type == ASENSOR_TYPE_GYROSCOPE) {
                 events[i].vector.x = smoothed_gyro[0]; 
                 events[i].vector.y = smoothed_gyro[1]; 
