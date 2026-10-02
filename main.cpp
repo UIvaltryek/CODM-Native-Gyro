@@ -104,13 +104,12 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
 
         for (ssize_t i = 0; i < actual_events; i++) {
             
-            // Standard Accelerometer (Type 1) - Game natively requests this at 200Hz
+            // Standard Calibrated Accelerometer (Type 1)
             if (events[i].type == ASENSOR_TYPE_ACCELEROMETER) { 
                 last_accel[0] = events[i].acceleration.v[0];
                 last_accel[1] = events[i].acceleration.v[1];
                 last_accel[2] = events[i].acceleration.v[2];
                 
-                // Time-travel stutter fix
                 if (events[i].timestamp > latest_ts) {
                     latest_ts = events[i].timestamp;
                 }
@@ -119,6 +118,7 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
             
             // Uncalibrated Compass (Type 14)
             else if (events[i].type == 14) { 
+                // Using .data[] bypasses NDK struct naming errors
                 last_mag[0] = events[i].data[0]; 
                 last_mag[1] = events[i].data[1]; 
                 last_mag[2] = events[i].data[2]; 
@@ -136,7 +136,6 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                 events[i].vector.z = smoothed_gyro[2]; 
             }
         }
-
 
         if (fusion_needed && latest_ts > 0) {
             compute_sensor_fusion(latest_ts);
