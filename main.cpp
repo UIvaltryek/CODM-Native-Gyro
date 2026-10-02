@@ -32,31 +32,34 @@ void compute_sensor_fusion(int64_t timestamp) {
     float ax = last_accel[0]; float ay = last_accel[1]; float az = last_accel[2];
     float mx = last_mag[0]; float my = last_mag[1]; float mz = last_mag[2];
 
-    float G = sqrt(ax*ax + ay*ay + az*az);
-    if (G < 0.1f) G = 0.1f; 
-
-    float gx = ax / G; float gy = ay / G; float gz = az / G;
-
-    float pitch = atan2(ay, az); 
+    // 1. Calculate Absolute Pitch and Roll
+    // Adding a tiny epsilon (0.001f) to az prevents the divide-by-zero stutter at exactly 90 degrees
+    float pitch = atan2(ay, az + ((az >= 0) ? 0.001f : -0.001f)); 
     
+    float G = sqrt(ax*ax + ay*ay + az*az);
+    if (G < 0.1f) G = 0.1f;
     float normalized_ax = -ax / G;
     if (normalized_ax > 1.0f) normalized_ax = 1.0f;
     if (normalized_ax < -1.0f) normalized_ax = -1.0f;
-    float roll = asin(normalized_ax); 
+    float roll = asin(normalized_ax);
 
-    float dot_mg = mx * gx + my * gy + mz * gz;
-    float hx = mx - dot_mg * gx;
-    float hy = my - dot_mg * gy;
-    float hz = mz - dot_mg * gz;
+    // 2. Calculate Absolute Yaw (Tilt-Compensated)
+    // This replaces the unstable acos(dot_product) math to fix high-speed swipe glitches
+    float cos_p = cos(pitch);
+    float sin_p = sin(pitch);
+    float cos_r = cos(roll);
+    float sin_r = sin(roll);
 
-    float H = sqrt(hx*hx + hy*hy + hz*hz);
-    if (H < 0.01f) H = 0.01f;
-    hx /= H; hy /= H; hz /= H; 
+    float mag_x_comp = mx * cos_p + mz * sin_p;
+    float mag_y_comp = mx * sin_r * sin_p + my * cos_r - mz * sin_r * cos_p;
+    float yaw = atan2(-mag_y_comp, mag_x_comp);
 
+    // First frame initialization
     if (last_timestamp == 0) {
         last_timestamp = timestamp;
-        last_pitch = pitch; last_roll = roll;
-        last_hx = hx; last_hy = hy; last_hz = hz;
+        last_pitch = pitch; 
+        last_roll = roll;
+        last_hz = yaw; // Re-using last_hz variable to store last_yaw state
         return;
     }
 
@@ -66,33 +69,30 @@ void compute_sensor_fusion(int64_t timestamp) {
         return;
     }
 
-    float speed_pitch = (pitch - last_pitch) / raw_dt;
-    float speed_roll = (roll - last_roll) / raw_dt;
+    // 3. Calculate Speed with Boundary Wrap Protection (Fixes the Snap-Back)
+    float delta_pitch = normalize_angle(pitch - last_pitch);
+    float delta_roll = normalize_angle(roll - last_roll);
+    float delta_yaw = normalize_angle(yaw - last_hz); 
 
-    float dot_h = hx * last_hx + hy * last_hy + hz * last_hz;
-    if (dot_h > 1.0f) dot_h = 1.0f;
-    if (dot_h < -1.0f) dot_h = -1.0f;
-    float mag_delta_yaw = acos(dot_h);
+    float speed_pitch = delta_pitch / raw_dt;
+    float speed_roll = delta_roll / raw_dt;
+    float speed_yaw = delta_yaw / raw_dt;
 
-    float cx = last_hy * hz - last_hz * hy;
-    float cy = last_hz * hx - last_hx * hz;
-    float cz = last_hx * hy - last_hy * hx;
-    float direction = cx * gx + cy * gy + cz * gz;
-    
-    if (direction < 0.0f) mag_delta_yaw = -mag_delta_yaw;
-    
-    float speed_yaw = mag_delta_yaw / raw_dt;
     if (fabs(speed_yaw) < MAG_NOISE_GATE) speed_yaw = 0.0f;
 
+    // 4. Gimbal Lock Fade Factor (Blend Roll and Yaw safely)
     float fade_factor = pow(fabs(sin(pitch)), 4.0f);
     float final_horizontal_speed = (speed_roll * (1.0f - fade_factor)) + (speed_yaw * fade_factor);
 
+    // 5. Apply EMA Filter
     smoothed_gyro[0] = ALPHA_ACCEL * speed_pitch + (1.0f - ALPHA_ACCEL) * smoothed_gyro[0];
     smoothed_gyro[1] = ALPHA_ACCEL * final_horizontal_speed + (1.0f - ALPHA_ACCEL) * smoothed_gyro[1];
     smoothed_gyro[2] = 0.0f;
 
-    last_pitch = pitch; last_roll = roll;
-    last_hx = hx; last_hy = hy; last_hz = hz;
+    // Save states for the next frame
+    last_pitch = pitch; 
+    last_roll = roll;
+    last_hz = yaw; 
     last_timestamp = timestamp;
 }
 
