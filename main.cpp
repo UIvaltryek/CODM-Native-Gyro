@@ -9,10 +9,10 @@
 #define M_PI 3.14159265358979323846f
 #endif
 
-static const float ALPHA_ACCEL = 0.95f; 
-static const float MAG_NOISE_GATE = 0.002f; 
+static const float MAG_NOISE_GATE = 0.001f; 
 
-static float smoothed_gyro[3] = {0.0f, 0.0f, 0.0f};
+// Renamed from smoothed_gyro since all filters are removed
+static float output_gyro[3] = {0.0f, 0.0f, 0.0f};
 
 static float last_accel[3] = {0.0f, 0.0f, 9.81f};
 static float last_mag[3] = {0.0f, 1.0f, 0.0f};
@@ -30,7 +30,6 @@ static getEvents_t orig_getEvents = nullptr;
 typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
 static setEventRate_t orig_setEventRate = nullptr;
 
-// NEW: Hook definitions for SensorManager bait-and-switch
 typedef ASensor const* (*getDefaultSensor_t)(ASensorManager*, int);
 static getDefaultSensor_t orig_getDefaultSensor = nullptr;
 
@@ -49,9 +48,9 @@ void compute_sensor_fusion(int64_t timestamp) {
 
     float G = sqrt(ax*ax + ay*ay + az*az);
     if (G < 0.1f) G = 0.1f; 
-
     float gx = ax / G; float gy = ay / G; float gz = az / G;
 
+    // Pitch remains completely untouched (allows natural up/down beyond 90 deg)
     float pitch = atan2(ay, az); 
     
     float normalized_ax = -ax / G;
@@ -59,10 +58,21 @@ void compute_sensor_fusion(int64_t timestamp) {
     if (normalized_ax < -1.0f) normalized_ax = -1.0f;
     float roll = asin(normalized_ax); 
 
-    float dot_mg = mx * gx + my * gy + mz * gz;
-    float hx = mx - dot_mg * gx;
-    float hy = my - dot_mg * gy;
-    float hz = mz - dot_mg * gz;
+    // THE 180-DEGREE FIX: Create a dedicated gravity vector just for the compass
+    float cgx = gx; float cgy = gy; float cgz = gz;
+    
+    // Clamp the compass Z-axis so the horizontal plane mathematically cannot flip upside down
+    if (cgz < 0.001f) cgz = 0.001f; 
+    
+    // Re-normalize the compass gravity vector
+    float cnorm = sqrt(cgx*cgx + cgy*cgy + cgz*cgz);
+    cgx /= cnorm; cgy /= cnorm; cgz /= cnorm;
+
+    // Project magnetic field using the locked compass plane
+    float dot_mg = mx * cgx + my * cgy + mz * cgz;
+    float hx = mx - dot_mg * cgx;
+    float hy = my - dot_mg * cgy;
+    float hz = mz - dot_mg * cgz;
 
     float H = sqrt(hx*hx + hy*hy + hz*hz);
     if (H < 0.001f) {
@@ -92,19 +102,21 @@ void compute_sensor_fusion(int64_t timestamp) {
     float cx = last_hy * hz - last_hz * hy;
     float cy = last_hz * hx - last_hx * hz;
     float cz = last_hx * hy - last_hy * hx;
-    float direction = cx * gx + cy * gy + cz * gz; 
+    
+    // Use the locked compass gravity here to prevent left/right inversion past 90 degrees
+    float direction = cx * cgx + cy * cgy + cz * cgz; 
 
     float mag_delta_yaw = atan2(direction, dot_h);
-    
     float speed_yaw = mag_delta_yaw / raw_dt;
     if (fabs(speed_yaw) < MAG_NOISE_GATE) speed_yaw = 0.0f;
 
     float fade_factor = pow(fabs(sin(pitch)), 4.0f);
     float final_horizontal_speed = (speed_roll * (1.0f - fade_factor)) + (speed_yaw * fade_factor);
 
-    smoothed_gyro[0] = ALPHA_ACCEL * speed_pitch + (1.0f - ALPHA_ACCEL) * smoothed_gyro[0];
-    smoothed_gyro[1] = ALPHA_ACCEL * final_horizontal_speed + (1.0f - ALPHA_ACCEL) * smoothed_gyro[1];
-    smoothed_gyro[2] = 0.0f;
+    // NO FILTER: Pushing pure hardware deltas directly to the game
+    output_gyro[0] = speed_pitch;
+    output_gyro[1] = final_horizontal_speed;
+    output_gyro[2] = 0.0f;
 
     last_pitch = pitch; last_roll = roll;
     last_hx = hx; last_hy = hy; last_hz = hz;
@@ -119,7 +131,7 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
 
         for (ssize_t i = 0; i < actual_events; i++) {
             
-            // Standard Calibrated Fallback (Just in case the hook misses)
+            // Standard Calibrated Fallback
             if (events[i].type == ASENSOR_TYPE_ACCELEROMETER) {
                 last_accel[0] = events[i].acceleration.v[0];
                 last_accel[1] = events[i].acceleration.v[1];
@@ -135,34 +147,30 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                 fusion_needed = true;
             } 
             
-            // TARGETED: Raw Uncalibrated Accelerometer (Type 35)
+            // Raw Uncalibrated Accelerometer (Type 35)
             else if (events[i].type == 35) {
                 last_accel[0] = events[i].data[0];
                 last_accel[1] = events[i].data[1];
                 last_accel[2] = events[i].data[2];
                 if (events[i].timestamp > latest_ts) latest_ts = events[i].timestamp;
                 fusion_needed = true;
-                
-                // MASK: Forge the packet back to Type 1 so Unity engine processes it normally
                 events[i].type = ASENSOR_TYPE_ACCELEROMETER; 
             }
             
-            // TARGETED: Raw Uncalibrated Compass (Type 14)
+            // Raw Uncalibrated Compass (Type 14)
             else if (events[i].type == 14) {
                 last_mag[0] = events[i].data[0];
                 last_mag[1] = events[i].data[1];
                 last_mag[2] = events[i].data[2];
                 if (events[i].timestamp > latest_ts) latest_ts = events[i].timestamp;
                 fusion_needed = true;
-                
-                // MASK: Forge the packet back to Type 2 so Unity engine processes it normally
                 events[i].type = ASENSOR_TYPE_MAGNETIC_FIELD; 
             }
             
             else if (events[i].type == ASENSOR_TYPE_GYROSCOPE) {
-                events[i].vector.x = smoothed_gyro[0]; 
-                events[i].vector.y = smoothed_gyro[1]; 
-                events[i].vector.z = smoothed_gyro[2]; 
+                events[i].vector.x = output_gyro[0]; 
+                events[i].vector.y = output_gyro[1]; 
+                events[i].vector.z = output_gyro[2]; 
             }
         }
 
@@ -177,14 +185,13 @@ int hook_ASensorEventQueue_setEventRate(ASensorEventQueue* queue, ASensor const*
     return orig_setEventRate(queue, sensor, 0); 
 }
 
-// THE BAIT AND SWITCH: Intercept the game's sensor request
 ASensor const* hook_ASensorManager_getDefaultSensor(ASensorManager* manager, int type) {
     if (type == ASENSOR_TYPE_ACCELEROMETER) {
-        ASensor const* uncal_accel = orig_getDefaultSensor(manager, 35); // 35 = Uncalibrated Accel
+        ASensor const* uncal_accel = orig_getDefaultSensor(manager, 35); 
         if (uncal_accel) return uncal_accel;
     }
     if (type == ASENSOR_TYPE_MAGNETIC_FIELD) {
-        ASensor const* uncal_mag = orig_getDefaultSensor(manager, 14); // 14 = Uncalibrated Mag
+        ASensor const* uncal_mag = orig_getDefaultSensor(manager, 14); 
         if (uncal_mag) return uncal_mag;
     }
     return orig_getDefaultSensor(manager, type);
