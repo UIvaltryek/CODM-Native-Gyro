@@ -103,12 +103,12 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
         int64_t latest_ts = 0;
 
         for (ssize_t i = 0; i < actual_events; i++) {
-              if (events[i].type == 35) { // 35 = ASENSOR_TYPE_ACCELEROMETER_UNCALIBRATED
-                
-                // Using .data[] bypasses NDK naming errors for uncalibrated structs
-                last_accel[0] = events[i].data[0];
-                last_accel[1] = events[i].data[1];
-                last_accel[2] = events[i].data[2];
+            
+            // Standard Accelerometer (Type 1) - Game natively requests this at 200Hz
+            if (events[i].type == ASENSOR_TYPE_ACCELEROMETER) { 
+                last_accel[0] = events[i].acceleration.v[0];
+                last_accel[1] = events[i].acceleration.v[1];
+                last_accel[2] = events[i].acceleration.v[2];
                 
                 // Time-travel stutter fix
                 if (events[i].timestamp > latest_ts) {
@@ -116,25 +116,27 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                 }
                 fusion_needed = true;
             } 
-            else if (events[i].type == 14) { // 14 = ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED
-                
-                // Using .data[] array bypasses NDK versioning errors for uncalibrated struct names
+            
+            // Uncalibrated Compass (Type 14)
+            else if (events[i].type == 14) { 
                 last_mag[0] = events[i].data[0]; 
                 last_mag[1] = events[i].data[1]; 
                 last_mag[2] = events[i].data[2]; 
-                
-                // Time-travel stutter fix
+
                 if (events[i].timestamp > latest_ts) {
                     latest_ts = events[i].timestamp;
                 }
                 fusion_needed = true;
             }
+            
+            // Inject calculated math into Virtual Gyroscope (Type 4)
             else if (events[i].type == ASENSOR_TYPE_GYROSCOPE) {
                 events[i].vector.x = smoothed_gyro[0]; 
                 events[i].vector.y = smoothed_gyro[1]; 
                 events[i].vector.z = smoothed_gyro[2]; 
             }
         }
+
 
         if (fusion_needed && latest_ts > 0) {
             compute_sensor_fusion(latest_ts);
