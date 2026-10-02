@@ -5,22 +5,20 @@
 #include "dobby.h"
 #include "zygisk.hpp"
 
-// Production Build: All logging removed, stutter timestamp fix applied
-static const float ALPHA_ACCEL = 0.65f; 
-static const float MAG_NOISE_GATE = 0.01f; 
+// Performance Tuning
+// Increased to 0.85f for instantaneous, zero-delay response.
+static const float ALPHA_ACCEL = 0.85f; 
 
 static float smoothed_gyro[3] = {0.0f, 0.0f, 0.0f};
 
-// Sensor States
+// Raw Sensor States
 static float last_accel[3] = {0.0f, 0.0f, 9.81f};
 static float last_mag[3] = {0.0f, 1.0f, 0.0f};
 static int64_t last_timestamp = 0;
 
-static float last_pitch = 0.0f;
-static float last_roll = 0.0f;
-static float last_hx = 0.0f;
-static float last_hy = 1.0f;
-static float last_hz = 0.0f;
+// 3D Vector Tracking States (Replaces Pitch/Roll/Yaw Angles)
+static float prev_a[3] = {0.0f, 0.0f, 1.0f};
+static float prev_h[3] = {0.0f, 1.0f, 0.0f};
 
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
 static getEvents_t orig_getEvents = nullptr;
@@ -28,81 +26,66 @@ static getEvents_t orig_getEvents = nullptr;
 typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
 static setEventRate_t orig_setEventRate = nullptr;
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846f
-#endif
-
-float normalize_angle(float angle) {
-    while (angle > M_PI) angle -= 2.0f * M_PI;
-    while (angle < -M_PI) angle += 2.0f * M_PI;
-    return angle;
-}
-
+// 3D Vector Cross-Product Fusion (Immune to Gimbal Lock and Boundary Snap-Back)
 void compute_sensor_fusion(int64_t timestamp) {
+    // 1. Normalize current Accelerometer (Gravity Vector)
     float ax = last_accel[0]; float ay = last_accel[1]; float az = last_accel[2];
+    float normA = sqrt(ax*ax + ay*ay + az*az);
+    if (normA < 0.1f) normA = 0.1f;
+    ax /= normA; ay /= normA; az /= normA;
+
+    // 2. Project Magnetometer onto a flat 2D plane perpendicular to Gravity
     float mx = last_mag[0]; float my = last_mag[1]; float mz = last_mag[2];
-
-    // 1. Calculate Absolute Pitch and Roll
-    // Adding a tiny epsilon (0.001f) to az prevents the divide-by-zero stutter at exactly 90 degrees
-    float pitch = atan2(ay, az + ((az >= 0) ? 0.001f : -0.001f)); 
+    float dotMA = mx * ax + my * ay + mz * az;
+    float hx = mx - dotMA * ax;
+    float hy = my - dotMA * ay;
+    float hz = mz - dotMA * az;
     
-    float G = sqrt(ax*ax + ay*ay + az*az);
-    if (G < 0.1f) G = 0.1f;
-    float normalized_ax = -ax / G;
-    if (normalized_ax > 1.0f) normalized_ax = 1.0f;
-    if (normalized_ax < -1.0f) normalized_ax = -1.0f;
-    float roll = asin(normalized_ax);
-
-    // 2. Calculate Absolute Yaw (Tilt-Compensated)
-    // This replaces the unstable acos(dot_product) math to fix high-speed swipe glitches
-    float cos_p = cos(pitch);
-    float sin_p = sin(pitch);
-    float cos_r = cos(roll);
-    float sin_r = sin(roll);
-
-    float mag_x_comp = mx * cos_p + mz * sin_p;
-    float mag_y_comp = mx * sin_r * sin_p + my * cos_r - mz * sin_r * cos_p;
-    float yaw = atan2(-mag_y_comp, mag_x_comp);
+    float normH = sqrt(hx*hx + hy*hy + hz*hz);
+    if (normH < 0.01f) normH = 0.01f;
+    hx /= normH; hy /= normH; hz /= normH;
 
     // First frame initialization
     if (last_timestamp == 0) {
-        last_timestamp = timestamp;
-        last_pitch = pitch; 
-        last_roll = roll;
-        last_hz = yaw; // Re-using last_hz variable to store last_yaw state
-        return;
-    }
-
-    float raw_dt = (timestamp - last_timestamp) / 1000000000.0f; 
-    if (raw_dt <= 0.0f || raw_dt > 0.1f) {
+        prev_a[0] = ax; prev_a[1] = ay; prev_a[2] = az;
+        prev_h[0] = hx; prev_h[1] = hy; prev_h[2] = hz;
         last_timestamp = timestamp;
         return;
     }
 
-    // 3. Calculate Speed with Boundary Wrap Protection (Fixes the Snap-Back)
-    float delta_pitch = normalize_angle(pitch - last_pitch);
-    float delta_roll = normalize_angle(roll - last_roll);
-    float delta_yaw = normalize_angle(yaw - last_hz); 
+    float dt = (timestamp - last_timestamp) / 1000000000.0f;
+    if (dt <= 0.0f || dt > 0.1f) {
+        last_timestamp = timestamp;
+        return;
+    }
 
-    float speed_pitch = delta_pitch / raw_dt;
-    float speed_roll = delta_roll / raw_dt;
-    float speed_yaw = delta_yaw / raw_dt;
+    // 3. CROSS PRODUCT 1: Pitch & Roll Velocity
+    float cx = prev_a[1] * az - prev_a[2] * ay;
+    float cy = prev_a[2] * ax - prev_a[0] * az;
+    float cz = prev_a[0] * ay - prev_a[1] * ax;
 
-    if (fabs(speed_yaw) < MAG_NOISE_GATE) speed_yaw = 0.0f;
+    // 4. CROSS PRODUCT 2: Yaw Velocity (Rotation around Gravity vector)
+    float hx_cross = prev_h[1] * hz - prev_h[2] * hy;
+    float hy_cross = prev_h[2] * hx - prev_h[0] * hz;
+    float hz_cross = prev_h[0] * hy - prev_h[1] * hx;
+    
+    // Dot product gives absolute Z-axis rotational speed
+    float yaw_sin = hx_cross * ax + hy_cross * ay + hz_cross * az;
+    float yaw_speed = yaw_sin / dt; 
 
-    // 4. Gimbal Lock Fade Factor (Blend Roll and Yaw safely)
-    float fade_factor = pow(fabs(sin(pitch)), 4.0f);
-    float final_horizontal_speed = (speed_roll * (1.0f - fade_factor)) + (speed_yaw * fade_factor);
+    // 5. Final 3D Gyroscope Output (rad/s)
+    float raw_gx = (cx / dt) + (yaw_speed * ax);
+    float raw_gy = (cy / dt) + (yaw_speed * ay);
+    float raw_gz = (cz / dt) + (yaw_speed * az);
 
-    // 5. Apply EMA Filter
-    smoothed_gyro[0] = ALPHA_ACCEL * speed_pitch + (1.0f - ALPHA_ACCEL) * smoothed_gyro[0];
-    smoothed_gyro[1] = ALPHA_ACCEL * final_horizontal_speed + (1.0f - ALPHA_ACCEL) * smoothed_gyro[1];
-    smoothed_gyro[2] = 0.0f;
+    // 6. Apply High-Speed EMA Filter
+    smoothed_gyro[0] = ALPHA_ACCEL * raw_gx + (1.0f - ALPHA_ACCEL) * smoothed_gyro[0];
+    smoothed_gyro[1] = ALPHA_ACCEL * raw_gy + (1.0f - ALPHA_ACCEL) * smoothed_gyro[1];
+    smoothed_gyro[2] = ALPHA_ACCEL * raw_gz + (1.0f - ALPHA_ACCEL) * smoothed_gyro[2];
 
-    // Save states for the next frame
-    last_pitch = pitch; 
-    last_roll = roll;
-    last_hz = yaw; 
+    // Save vectors for the next frame
+    prev_a[0] = ax; prev_a[1] = ay; prev_a[2] = az;
+    prev_h[0] = hx; prev_h[1] = hy; prev_h[2] = hz;
     last_timestamp = timestamp;
 }
 
@@ -119,26 +102,33 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                 last_accel[0] = events[i].acceleration.v[0];
                 last_accel[1] = events[i].acceleration.v[1];
                 last_accel[2] = events[i].acceleration.v[2];
-                
-                if (events[i].timestamp > latest_ts) {
-                    latest_ts = events[i].timestamp;
-                }
+                if (events[i].timestamp > latest_ts) latest_ts = events[i].timestamp;
                 fusion_needed = true;
             } 
-            
-            // Uncalibrated Compass (Type 14)
+            // Uncalibrated Accelerometer (Type 35) Fallback
+            else if (events[i].type == 35) { 
+                last_accel[0] = events[i].data[0];
+                last_accel[1] = events[i].data[1];
+                last_accel[2] = events[i].data[2];
+                if (events[i].timestamp > latest_ts) latest_ts = events[i].timestamp;
+                fusion_needed = true;
+            }
+            // Standard Calibrated Compass (Type 2)
+            else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD) { 
+                last_mag[0] = events[i].magnetic.v[0]; 
+                last_mag[1] = events[i].magnetic.v[1]; 
+                last_mag[2] = events[i].magnetic.v[2]; 
+                if (events[i].timestamp > latest_ts) latest_ts = events[i].timestamp;
+                fusion_needed = true;
+            }
+            // Uncalibrated Compass (Type 14) Fallback
             else if (events[i].type == 14) { 
-                // Using .data[] bypasses NDK struct naming errors
                 last_mag[0] = events[i].data[0]; 
                 last_mag[1] = events[i].data[1]; 
                 last_mag[2] = events[i].data[2]; 
-
-                if (events[i].timestamp > latest_ts) {
-                    latest_ts = events[i].timestamp;
-                }
+                if (events[i].timestamp > latest_ts) latest_ts = events[i].timestamp;
                 fusion_needed = true;
             }
-            
             // Inject calculated math into Virtual Gyroscope (Type 4)
             else if (events[i].type == ASENSOR_TYPE_GYROSCOPE) {
                 events[i].vector.x = smoothed_gyro[0]; 
