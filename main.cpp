@@ -28,6 +28,16 @@ static getEvents_t orig_getEvents = nullptr;
 typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
 static setEventRate_t orig_setEventRate = nullptr;
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846f
+#endif
+
+float normalize_angle(float angle) {
+    while (angle > M_PI) angle -= 2.0f * M_PI;
+    while (angle < -M_PI) angle += 2.0f * M_PI;
+    return angle;
+}
+
 void compute_sensor_fusion(int64_t timestamp) {
     float ax = last_accel[0]; float ay = last_accel[1]; float az = last_accel[2];
     float mx = last_mag[0]; float my = last_mag[1]; float mz = last_mag[2];
