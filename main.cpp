@@ -9,8 +9,8 @@
 #define M_PI 3.14159265358979323846f
 #endif
 
-static const float ALPHA_ACCEL = 0.75f; 
-static const float MAG_NOISE_GATE = 0.015f; 
+static const float ALPHA_ACCEL = 0.95f; 
+static const float MAG_NOISE_GATE = 0.002f; 
 
 static float smoothed_gyro[3] = {0.0f, 0.0f, 0.0f};
 
