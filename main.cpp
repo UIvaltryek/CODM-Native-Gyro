@@ -5,91 +5,75 @@
 #include "dobby.h"
 #include "zygisk.hpp"
 
-// --- TUNABLE MIDDLEMAN PARAMETERS ---
-static const float ANTI_LAG_BOOST = 1.2f; 
-static const float MTK_DEADZONE_THRESHOLD = 0.15f; 
-// Your exact proposed baseline, kept just under the engine threshold
-static const float BASELINE_BIAS = 0.149999f; 
+// --- TUNABLE PARAMETERS ---
+// 1. Hardware noise limit. Drops static table drift to 0.0.
+static const float NOISE_FLOOR = 0.008f; 
+// 2. The game engine's suppression wall (ADZ Teleport)
+static const float MTK_DEADZONE = 0.15f; 
+// 3. Phase-Lead Multiplier. Cancels the "smooth delay" by pushing aim forward.
+static const float LAG_COMPENSATION = 2.5f;
 
-static float output_gyro[3] = {0.0f, 0.0f, 0.0f};
-static float last_stock_gyro[3] = {0.0f, 0.0f, 0.0f};
-static int64_t last_timestamp = 0;
+// Memory to track the previous frame's position
+static float last_raw_x = 0.0f;
+static float last_raw_y = 0.0f;
+static float last_raw_z = 0.0f;
 
-// Memory variables to track the last known direction of each axis
-static float last_sign_x = 1.0f;
-static float last_sign_y = 1.0f;
-static float last_sign_z = 1.0f;
+// Memory to track the previous frame's speed (to detect braking)
+static float last_delta_x = 0.0f;
+static float last_delta_y = 0.0f;
+static float last_delta_z = 0.0f;
 
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
 static getEvents_t orig_getEvents = nullptr;
 typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
 static setEventRate_t orig_setEventRate = nullptr;
 
-void reshape_stock_gyro(float stock_x, float stock_y, float stock_z, int64_t timestamp) {
-    if (last_timestamp == 0) {
-        last_timestamp = timestamp;
-        last_stock_gyro[0] = stock_x; last_stock_gyro[1] = stock_y; last_stock_gyro[2] = stock_z;
-        return;
+// Phase-Lead Remap Function with Deceleration Damping (Dynamic Brake)
+float process_axis(float current_val, float &last_val, float &last_delta) {
+    float abs_val = fabs(current_val);
+    
+    // 1. Kill the static table drift
+    if (abs_val < NOISE_FLOOR) {
+        last_val = current_val; 
+        last_delta = 0.0f;
+        return 0.0f; 
     }
-
-    float dt = (timestamp - last_timestamp) / 1000000000.0f; 
-    if (dt <= 0.001f || dt > 0.1f) { 
-        last_timestamp = timestamp;
-        return;
+    
+    // 2. Calculate current speed (frame-to-frame change)
+    float current_delta = current_val - last_val;
+    float abs_current_delta = fabs(current_delta);
+    float abs_last_delta = fabs(last_delta);
+    
+    // 3. Dynamic Brake: Are we accelerating or decelerating?
+    float dynamic_boost = LAG_COMPENSATION;
+    if (abs_current_delta < abs_last_delta) {
+        // Hand is slowing down (flick is ending). Kill the boost to prevent overshoot.
+        dynamic_boost = 0.0f; 
     }
-
-    // --- 1. ANTI-LAG PREDICTIVE BOOST ---
-    float accel_x = (stock_x - last_stock_gyro[0]) / dt;
-    float accel_y = (stock_y - last_stock_gyro[1]) / dt;
-    float accel_z = (stock_z - last_stock_gyro[2]) / dt;
-
-    float boosted_x = stock_x + (accel_x * dt * ANTI_LAG_BOOST);
-    float boosted_y = stock_y + (accel_y * dt * ANTI_LAG_BOOST);
-    float boosted_z = stock_z + (accel_z * dt * ANTI_LAG_BOOST);
-
-    // --- 2. DIRECTIONAL MEMORY TRACKING ---
-    // Update the memory sign if there is active directional movement
-    if (boosted_x > 0.000001f) last_sign_x = 1.0f;
-    else if (boosted_x < -0.000001f) last_sign_x = -1.0f;
-
-    if (boosted_y > 0.000001f) last_sign_y = 1.0f;
-    else if (boosted_y < -0.000001f) last_sign_y = -1.0f;
-
-    if (boosted_z > 0.000001f) last_sign_z = 1.0f;
-    else if (boosted_z < -0.000001f) last_sign_z = -1.0f;
-
-    // --- 3. DYNAMIC BASELINE INJECTION ---
-    // If movement is trapped inside the deadzone, inject the directional baseline bias
-    if (fabs(boosted_x) < MTK_DEADZONE_THRESHOLD) {
-        boosted_x = (last_sign_x * BASELINE_BIAS) + (boosted_x * 2.0f);
-    }
-    if (fabs(boosted_y) < MTK_DEADZONE_THRESHOLD) {
-        boosted_y = (last_sign_y * BASELINE_BIAS) + (boosted_y * 2.0f);
-    }
-    if (fabs(boosted_z) < MTK_DEADZONE_THRESHOLD) {
-        boosted_z = (last_sign_z * BASELINE_BIAS) + (boosted_z * 2.0f);
-    }
-
-    // Direct hardware-to-engine output
-    output_gyro[0] = boosted_x;
-    output_gyro[1] = boosted_y;
-    output_gyro[2] = boosted_z;
-
-    last_stock_gyro[0] = stock_x; 
-    last_stock_gyro[1] = stock_y; 
-    last_stock_gyro[2] = stock_z;
-    last_timestamp = timestamp;
+    
+    // Push the output forward using the dynamically braked multiplier
+    float predicted_val = current_val + (current_delta * dynamic_boost);
+    
+    // Save current frame data for the next calculation
+    last_val = current_val; 
+    last_delta = current_delta;
+    
+    // 4. Continuous Deadzone Bypass
+    float sign = (predicted_val > 0.0f) ? 1.0f : -1.0f;
+    return (sign * MTK_DEADZONE) + predicted_val;
 }
 
 ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent* events, size_t count) {
     ssize_t actual_events = orig_getEvents(queue, events, count);
     if (actual_events > 0) {
         for (ssize_t i = 0; i < actual_events; i++) {
+            
+            // Intercept only the Calibrated Stock Gyroscope (Type 4)
             if (events[i].type == ASENSOR_TYPE_GYROSCOPE) {
-                reshape_stock_gyro(events[i].vector.x, events[i].vector.y, events[i].vector.z, events[i].timestamp);
-                events[i].vector.x = output_gyro[0]; 
-                events[i].vector.y = output_gyro[1]; 
-                events[i].vector.z = output_gyro[2]; 
+                // Process each axis through the Phase-Lead compensator directly
+                events[i].vector.x = process_axis(events[i].vector.x, last_raw_x, last_delta_x);
+                events[i].vector.y = process_axis(events[i].vector.y, last_raw_y, last_delta_y);
+                events[i].vector.z = process_axis(events[i].vector.z, last_raw_z, last_delta_z);
             }
         }
     }
@@ -97,6 +81,7 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
 }
 
 int hook_ASensorEventQueue_setEventRate(ASensorEventQueue* queue, ASensor const* sensor, int32_t usec) {
+    // Override the game's requested delay, force fastest possible polling rate
     return orig_setEventRate(queue, sensor, 0); 
 }
 
