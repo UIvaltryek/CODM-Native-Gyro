@@ -6,9 +6,9 @@
 #include "zygisk.hpp"
 
 // --- TUNABLE MIDDLEMAN PARAMETERS ---
-// 1. Pushes the signal forward to cancel MediaTek's low-pass delay
-static const float ANTI_LAG_BOOST = 0.6f; 
-// 2. The exact mathematical suppression threshold of the stock OS
+// Pushes the signal forward aggressively to cancel MediaTek's low-pass delay
+static const float ANTI_LAG_BOOST = 1.2f; 
+// The exact mathematical suppression threshold of the stock OS
 static const float MTK_DEADZONE_THRESHOLD = 0.15f; 
 
 static float output_gyro[3] = {0.0f, 0.0f, 0.0f};
@@ -43,26 +43,26 @@ void reshape_stock_gyro(float stock_x, float stock_y, float stock_z, int64_t tim
     float boosted_z = stock_z + (accel_z * dt * ANTI_LAG_BOOST);
 
     // --- 2. ANTI-DEADZONE INJECTION (ADZ) ---
-    // If movement is suppressed below 0.15 rad/s but isn't a dead zero, teleport it out of the deadzone
-    if (fabs(stock_x) > 0.001f && fabs(stock_x) < MTK_DEADZONE_THRESHOLD) {
+    // Floor lowered to 1e-6 to catch heavily suppressed floats before they hit absolute zero
+    if (fabs(stock_x) > 0.000001f && fabs(stock_x) < MTK_DEADZONE_THRESHOLD) {
         float sign_x = (stock_x > 0.0f) ? 1.0f : -1.0f;
-        boosted_x = (sign_x * MTK_DEADZONE_THRESHOLD) + (stock_x * 1.5f);
+        boosted_x = (sign_x * MTK_DEADZONE_THRESHOLD) + (stock_x * 2.0f);
     }
     
-    if (fabs(stock_y) > 0.001f && fabs(stock_y) < MTK_DEADZONE_THRESHOLD) {
+    if (fabs(stock_y) > 0.000001f && fabs(stock_y) < MTK_DEADZONE_THRESHOLD) {
         float sign_y = (stock_y > 0.0f) ? 1.0f : -1.0f;
-        boosted_y = (sign_y * MTK_DEADZONE_THRESHOLD) + (stock_y * 1.5f);
+        boosted_y = (sign_y * MTK_DEADZONE_THRESHOLD) + (stock_y * 2.0f);
     }
     
-    if (fabs(stock_z) > 0.001f && fabs(stock_z) < MTK_DEADZONE_THRESHOLD) {
+    if (fabs(stock_z) > 0.000001f && fabs(stock_z) < MTK_DEADZONE_THRESHOLD) {
         float sign_z = (stock_z > 0.0f) ? 1.0f : -1.0f;
-        boosted_z = (sign_z * MTK_DEADZONE_THRESHOLD) + (stock_z * 1.5f);
+        boosted_z = (sign_z * MTK_DEADZONE_THRESHOLD) + (stock_z * 2.0f);
     }
 
-    // Apply a lightweight low-pass blend to smooth the teleported data injection
-    output_gyro[0] = (output_gyro[0] * 0.4f) + (boosted_x * 0.6f);
-    output_gyro[1] = (output_gyro[1] * 0.4f) + (boosted_y * 0.6f);
-    output_gyro[2] = (output_gyro[2] * 0.4f) + (boosted_z * 0.6f);
+    // Direct hardware-to-engine output (zero smoothing to eliminate phase lag)
+    output_gyro[0] = boosted_x;
+    output_gyro[1] = boosted_y;
+    output_gyro[2] = boosted_z;
 
     last_stock_gyro[0] = stock_x; 
     last_stock_gyro[1] = stock_y; 
@@ -88,6 +88,7 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
 }
 
 int hook_ASensorEventQueue_setEventRate(ASensorEventQueue* queue, ASensor const* sensor, int32_t usec) {
+    // Override the game's requested delay, force fastest possible polling rate
     return orig_setEventRate(queue, sensor, 0); 
 }
 
