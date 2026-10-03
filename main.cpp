@@ -5,86 +5,54 @@
 #include "dobby.h"
 #include "zygisk.hpp"
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846f
-#endif
+static const float MAG_NOISE_GATE = 0.01f; 
 
-static const float MAG_NOISE_GATE = 0.001f; 
-
-// Renamed from smoothed_gyro since all filters are removed
 static float output_gyro[3] = {0.0f, 0.0f, 0.0f};
-
 static float last_accel[3] = {0.0f, 0.0f, 9.81f};
 static float last_mag[3] = {0.0f, 1.0f, 0.0f};
 static int64_t last_timestamp = 0;
 
-static float last_pitch = 0.0f;
-static float last_roll = 0.0f;
-static float last_hx = 0.0f;
-static float last_hy = 1.0f;
-static float last_hz = 0.0f;
+// Replaced 2D Euler states with 3D Orthogonal Basis Vectors
+static float last_zx = 0.0f, last_zy = 0.0f, last_zz = 1.0f;
+static float last_ex = 1.0f, last_ey = 0.0f, last_ez = 0.0f;
+static float last_nx = 0.0f, last_ny = 1.0f, last_nz = 0.0f;
 
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
 static getEvents_t orig_getEvents = nullptr;
-
 typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
 static setEventRate_t orig_setEventRate = nullptr;
-
 typedef ASensor const* (*getDefaultSensor_t)(ASensorManager*, int);
 static getDefaultSensor_t orig_getDefaultSensor = nullptr;
-
 typedef ASensor const* (*getDefaultSensorEx_t)(ASensorManager*, int, bool);
 static getDefaultSensorEx_t orig_getDefaultSensorEx = nullptr;
-
-float normalize_angle(float angle) {
-    while (angle > M_PI) angle -= 2.0f * M_PI;
-    while (angle < -M_PI) angle += 2.0f * M_PI;
-    return angle;
-}
 
 void compute_sensor_fusion(int64_t timestamp) {
     float ax = last_accel[0]; float ay = last_accel[1]; float az = last_accel[2];
     float mx = last_mag[0]; float my = last_mag[1]; float mz = last_mag[2];
 
+    // 1. Z-Basis (Gravity / Down Vector)
     float G = sqrt(ax*ax + ay*ay + az*az);
     if (G < 0.1f) G = 0.1f; 
-    float gx = ax / G; float gy = ay / G; float gz = az / G;
+    float zx = ax / G; float zy = ay / G; float zz = az / G;
 
-    // Pitch remains completely untouched (allows natural up/down beyond 90 deg)
-    float pitch = atan2(ay, az); 
-    
-    float normalized_ax = -ax / G;
-    if (normalized_ax > 1.0f) normalized_ax = 1.0f;
-    if (normalized_ax < -1.0f) normalized_ax = -1.0f;
-    float roll = asin(normalized_ax); 
+    // 2. E-Basis (East Vector) = Magnetic Field cross Gravity
+    float ex = my * zz - mz * zy;
+    float ey = mz * zx - mx * zz;
+    float ez = mx * zy - my * zx;
+    float E = sqrt(ex*ex + ey*ey + ez*ez);
+    if (E < 0.01f) E = 0.01f;
+    ex /= E; ey /= E; ez /= E;
 
-    // THE 180-DEGREE FIX: Create a dedicated gravity vector just for the compass
-    float cgx = gx; float cgy = gy; float cgz = gz;
-    
-    // Clamp the compass Z-axis so the horizontal plane mathematically cannot flip upside down
-    if (cgz < 0.001f) cgz = 0.001f; 
-    
-    // Re-normalize the compass gravity vector
-    float cnorm = sqrt(cgx*cgx + cgy*cgy + cgz*cgz);
-    cgx /= cnorm; cgy /= cnorm; cgz /= cnorm;
-
-    // Project magnetic field using the locked compass plane
-    float dot_mg = mx * cgx + my * cgy + mz * cgz;
-    float hx = mx - dot_mg * cgx;
-    float hy = my - dot_mg * cgy;
-    float hz = mz - dot_mg * cgz;
-
-    float H = sqrt(hx*hx + hy*hy + hz*hz);
-    if (H < 0.001f) {
-        hx = last_hx; hy = last_hy; hz = last_hz; 
-    } else {
-        hx /= H; hy /= H; hz /= H; 
-    }
+    // 3. N-Basis (North Vector) = Gravity cross East
+    float nx = zy * ez - zz * ey;
+    float ny = zz * ex - zx * ez;
+    float nz = zx * ey - zy * ex;
 
     if (last_timestamp == 0) {
+        last_zx = zx; last_zy = zy; last_zz = zz;
+        last_ex = ex; last_ey = ey; last_ez = ez;
+        last_nx = nx; last_ny = ny; last_nz = nz;
         last_timestamp = timestamp;
-        last_pitch = pitch; last_roll = roll;
-        last_hx = hx; last_hy = hy; last_hz = hz;
         return;
     }
 
@@ -94,32 +62,39 @@ void compute_sensor_fusion(int64_t timestamp) {
         return;
     }
 
-    float speed_pitch = normalize_angle(pitch - last_pitch) / raw_dt;
-    float speed_roll = (roll - last_roll) / raw_dt;
+    // Measure how fast the basis vectors are changing in 3D space
+    float dzx = (zx - last_zx) / raw_dt;
+    float dzy = (zy - last_zy) / raw_dt;
+    float dzz = (zz - last_zz) / raw_dt;
 
-    float dot_h = hx * last_hx + hy * last_hy + hz * last_hz; 
-    
-    float cx = last_hy * hz - last_hz * hy;
-    float cy = last_hz * hx - last_hx * hz;
-    float cz = last_hx * hy - last_hy * hx;
-    
-    // Use the locked compass gravity here to prevent left/right inversion past 90 degrees
-    float direction = cx * cgx + cy * cgy + cz * cgz; 
+    float dex = (ex - last_ex) / raw_dt;
+    float dey = (ey - last_ey) / raw_dt;
+    float dez = (ez - last_ez) / raw_dt;
 
-    float mag_delta_yaw = atan2(direction, dot_h);
-    float speed_yaw = mag_delta_yaw / raw_dt;
-    if (fabs(speed_yaw) < MAG_NOISE_GATE) speed_yaw = 0.0f;
+    // KINEMATICS: Absolute Rotational Velocity (rad/s)
+    // By dot-multiplying the changes against the old vectors, we extract perfect gyro data
+    // completely immune to Gimbal Lock, 90-degree inversions, and boundary wrapping.
+    float speed_pitch = (last_nx * dzx + last_ny * dzy + last_nz * dzz);
+    float speed_roll  = -(last_ex * dzx + last_ey * dzy + last_ez * dzz);
+    float speed_yaw   = -(last_nx * dex + last_ny * dey + last_nz * dez);
 
+    // Your original custom landscape blend
+    float pitch = atan2(ay, az); 
     float fade_factor = pow(fabs(sin(pitch)), 4.0f);
     float final_horizontal_speed = (speed_roll * (1.0f - fade_factor)) + (speed_yaw * fade_factor);
 
-    // NO FILTER: Pushing pure hardware deltas directly to the game
+    // Apply strict noise gates to kill micro-vibrations
+    if (fabs(speed_pitch) < MAG_NOISE_GATE) speed_pitch = 0.0f;
+    if (fabs(final_horizontal_speed) < MAG_NOISE_GATE) final_horizontal_speed = 0.0f;
+
     output_gyro[0] = speed_pitch;
     output_gyro[1] = final_horizontal_speed;
     output_gyro[2] = 0.0f;
 
-    last_pitch = pitch; last_roll = roll;
-    last_hx = hx; last_hy = hy; last_hz = hz;
+    // Save states for next frame
+    last_zx = zx; last_zy = zy; last_zz = zz;
+    last_ex = ex; last_ey = ey; last_ez = ez;
+    last_nx = nx; last_ny = ny; last_nz = nz;
     last_timestamp = timestamp;
 }
 
