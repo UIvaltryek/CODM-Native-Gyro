@@ -6,109 +6,109 @@
 #include "zygisk.hpp"
 
 // --- TUNABLE PARAMETERS ---
-static const float MTK_DEADZONE = 0.15f; 
-static const float LAG_COMPENSATION = 2.5f;
+// 1. Raw Hardware Smoothing (0.1 to 1.0). 
+// Lower = smoother but slight delay. Higher = instant but picks up hand jitter.
+static const float VECTOR_SMOOTHING = 0.6f; 
 
-// 1. Fixes the "slow" heavy feeling of the stock vgyro macro-movements
-// 2.0f means your physical sweeps are instantly doubled in speed before hitting the engine.
-static const float MACRO_SENSITIVITY = 2.0f; 
+// 2. Master Sensitivity Scaler
+static const float SENSITIVITY = 1.0f;
 
-// 2. Multiplier to match our raw Accel/Mag micro-derivatives to the game's expected sensitivity
-static const float MICRO_AIM_SENSITIVITY = 1.5f; 
+// 3. Absolute Noise Floor (Kills static crosshair drift when phone is on a table)
+static const float NOISE_FLOOR = 0.005f;
 
-// Memory for raw sensors
-static float last_acc[3] = {0.0f, 0.0f, 0.0f};
-static float last_mag[3] = {0.0f, 0.0f, 0.0f};
+// --- 3D Vector Math Structs ---
+struct Vec3 { float x, y, z; };
+
+Vec3 cross_product(Vec3 a, Vec3 b) {
+    return { a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x };
+}
+float dot_product(Vec3 a, Vec3 b) {
+    return a.x*b.x + a.y*b.y + a.z*b.z;
+}
+Vec3 normalize(Vec3 v) {
+    float len = sqrt(v.x*v.x + v.y*v.y + v.z*v.z);
+    if (len < 0.0001f) return {0.0f, 0.0f, 0.0f};
+    return { v.x/len, v.y/len, v.z/len };
+}
+Vec3 scale(Vec3 v, float s) {
+    return { v.x*s, v.y*s, v.z*s };
+}
+Vec3 add(Vec3 a, Vec3 b) {
+    return { a.x+b.x, a.y+b.y, a.z+b.z };
+}
+
+// --- Memory State ---
+static Vec3 last_norm_acc = {0.0f, 0.0f, 0.0f};
+static Vec3 last_norm_mag = {0.0f, 0.0f, 0.0f};
 static int64_t last_acc_ts = 0;
 static int64_t last_mag_ts = 0;
 
-// Memory for Phase-Lead (Macro movements)
-static float last_vgyro[3] = {0.0f, 0.0f, 0.0f};
-static float last_vgyro_delta[3] = {0.0f, 0.0f, 0.0f};
+static Vec3 current_omega_acc = {0.0f, 0.0f, 0.0f};
+static Vec3 current_omega_mag = {0.0f, 0.0f, 0.0f};
 
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
 static getEvents_t orig_getEvents = nullptr;
+
 typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
 static setEventRate_t orig_setEventRate = nullptr;
-
-// Calculates the raw speed of the physical sensors
-float get_sensor_derivative(float current, float &last, int64_t current_ts, int64_t &last_ts) {
-    if (last_ts == 0) {
-        last = current; last_ts = current_ts; return 0.0f;
-    }
-    float dt = (current_ts - last_ts) / 1000000000.0f;
-    if (dt <= 0.001f || dt > 0.1f) return 0.0f;
-    
-    float speed = (current - last) / dt;
-    last = current; last_ts = current_ts;
-    return speed;
-}
-
-// Processes the final output sent to Call of Duty
-float splice_axis(float raw_vgyro_val, float raw_fallback_speed, float &last_vgyro_val, float &last_delta) {
-    float abs_vgyro = fabs(raw_vgyro_val);
-    
-    // 1. THE GAP FILLER (Micro-Aiming)
-    // If the SCP deadzone ate the movement (outputs exactly 0.0 or near zero)
-    if (abs_vgyro < 0.01f) {
-        last_vgyro_val = 0.0f; 
-        last_delta = 0.0f;
-        // Inject our raw hardware derivative, scaled to bypass the game's internal deadzone
-        if (fabs(raw_fallback_speed) > 0.05f) { // Noise floor for raw hardware static
-            float sign = (raw_fallback_speed > 0.0f) ? 1.0f : -1.0f;
-            return (sign * MTK_DEADZONE) + (raw_fallback_speed * MICRO_AIM_SENSITIVITY);
-        }
-        return 0.0f;
-    }
-    
-    // 2. FIX SLOW TRACKING (Scale the stock data up)
-    float scaled_vgyro = raw_vgyro_val * MACRO_SENSITIVITY;
-    
-    // 3. THE PHASE-LEAD BRAKE (Macro-Aiming / Flicks)
-    float current_delta = scaled_vgyro - last_vgyro_val;
-    float dynamic_boost = LAG_COMPENSATION;
-    
-    // If decelerating, kill the anti-lag boost so the crosshair stops dead
-    if (fabs(current_delta) < fabs(last_delta)) {
-        dynamic_boost = 0.0f; 
-    }
-    
-    float predicted_val = scaled_vgyro + (current_delta * dynamic_boost);
-    
-    // Update memory state using the scaled values
-    last_vgyro_val = scaled_vgyro; 
-    last_delta = current_delta;
-    
-    return predicted_val;
-}
 
 ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent* events, size_t count) {
     ssize_t actual_events = orig_getEvents(queue, events, count);
     if (actual_events > 0) {
         for (ssize_t i = 0; i < actual_events; i++) {
             
-            // Track Raw Accelerometer (For Pitch / Vertical Micro-Aim)
+            // 1. Process Raw Gravity (Pitch & Roll)
             if (events[i].type == ASENSOR_TYPE_ACCELEROMETER) {
-                get_sensor_derivative(events[i].vector.x, last_acc[0], events[i].timestamp, last_acc_ts);
-                get_sensor_derivative(events[i].vector.y, last_acc[1], events[i].timestamp, last_acc_ts);
-                get_sensor_derivative(events[i].vector.z, last_acc[2], events[i].timestamp, last_acc_ts);
+                Vec3 curr_acc = normalize({events[i].vector.x, events[i].vector.y, events[i].vector.z});
+                
+                if (last_acc_ts != 0) {
+                    float dt = (events[i].timestamp - last_acc_ts) / 1000000000.0f;
+                    if (dt > 0.001f && dt < 0.1f) {
+                        // Apply lightweight EMA filter to kill hardware jitter
+                        curr_acc = normalize(add(scale(curr_acc, VECTOR_SMOOTHING), scale(last_norm_acc, 1.0f - VECTOR_SMOOTHING)));
+                        
+                        // KINEMATICS: Cross product of current x last yields device rotation in rad/s
+                        current_omega_acc = scale(cross_product(curr_acc, last_norm_acc), 1.0f / dt);
+                    }
+                }
+                last_norm_acc = curr_acc;
+                last_acc_ts = events[i].timestamp;
             }
-            // Track Raw Compass (For Yaw / Horizontal Micro-Aim)
+            
+            // 2. Process Raw Magnetic North (Yaw)
             else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD || events[i].type == 14) {
-                get_sensor_derivative(events[i].vector.x, last_mag[0], events[i].timestamp, last_mag_ts);
-                get_sensor_derivative(events[i].vector.y, last_mag[1], events[i].timestamp, last_mag_ts);
-                get_sensor_derivative(events[i].vector.z, last_mag[2], events[i].timestamp, last_mag_ts);
+                Vec3 curr_mag = normalize({events[i].vector.x, events[i].vector.y, events[i].vector.z});
+                
+                if (last_mag_ts != 0) {
+                    float dt = (events[i].timestamp - last_mag_ts) / 1000000000.0f;
+                    if (dt > 0.001f && dt < 0.1f) {
+                        curr_mag = normalize(add(scale(curr_mag, VECTOR_SMOOTHING), scale(last_norm_mag, 1.0f - VECTOR_SMOOTHING)));
+                        current_omega_mag = scale(cross_product(curr_mag, last_norm_mag), 1.0f / dt);
+                    }
+                }
+                last_norm_mag = curr_mag;
+                last_mag_ts = events[i].timestamp;
             }
-            // Intercept and Splice the Virtual Gyro
+            
+            // 3. Output Synthesis (Overwrite the deadzoned Type 4 Gyro)
             else if (events[i].type == ASENSOR_TYPE_GYROSCOPE) {
                 
-                // Assuming standard Landscape mode mapping. If Pitch/Yaw micro-aim is swapped, switch x/y here.
-                float pitch_fallback = get_sensor_derivative(events[i].vector.x, last_acc[0], events[i].timestamp, last_acc_ts); 
-                float yaw_fallback = get_sensor_derivative(events[i].vector.y, last_mag[1], events[i].timestamp, last_mag_ts);   
+                // Dot product projects the magnetic rotation strictly onto the gravity axis (Isolating pure Yaw)
+                float yaw_scalar = dot_product(current_omega_mag, last_norm_acc);
+                Vec3 isolated_yaw = scale(last_norm_acc, yaw_scalar);
                 
-                events[i].vector.x = splice_axis(events[i].vector.x, pitch_fallback, last_vgyro[0], last_vgyro_delta[0]);
-                events[i].vector.y = splice_axis(events[i].vector.y, yaw_fallback, last_vgyro[1], last_vgyro_delta[1]);
-                events[i].vector.z = splice_axis(events[i].vector.z, 0.0f, last_vgyro[2], last_vgyro_delta[2]); 
+                // Combine Gravity-based Pitch/Roll with Magnetic-based Yaw
+                Vec3 final_gyro = add(current_omega_acc, isolated_yaw);
+                
+                // Apply Sensitivity and Noise Gate
+                float out_x = (fabs(final_gyro.x) > NOISE_FLOOR) ? final_gyro.x * SENSITIVITY : 0.0f;
+                float out_y = (fabs(final_gyro.y) > NOISE_FLOOR) ? final_gyro.y * SENSITIVITY : 0.0f;
+                float out_z = (fabs(final_gyro.z) > NOISE_FLOOR) ? final_gyro.z * SENSITIVITY : 0.0f;
+
+                // Overwrite the SCP payload
+                events[i].vector.x = out_x;
+                events[i].vector.y = out_y;
+                events[i].vector.z = out_z;
             }
         }
     }
@@ -116,6 +116,7 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
 }
 
 int hook_ASensorEventQueue_setEventRate(ASensorEventQueue* queue, ASensor const* sensor, int32_t usec) {
+    // Force Android to give us the absolute maximum polling rate for all sensors
     return orig_setEventRate(queue, sensor, 0); 
 }
 
