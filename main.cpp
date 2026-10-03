@@ -5,8 +5,9 @@
 #include "dobby.h"
 #include "zygisk.hpp"
 
-// The electronic brake to stop the "springy rubberband" effect on flicks
-static const float MAG_NOISE_GATE = 0.01f; 
+// Madgwick Beta (Filter Gain). 
+// Lower = smoother but slower. Higher = faster but picks up more noise. 0.1f is standard.
+static const float BETA = 0.1f; 
 
 static float output_gyro[3] = {0.0f, 0.0f, 0.0f};
 
@@ -15,13 +16,7 @@ static float last_mag[3] = {0.0f, 1.0f, 0.0f};
 static int64_t last_timestamp = 0;
 
 // 4D Quaternion State (w, x, y, z)
-static float last_qw = 1.0f;
-static float last_qx = 0.0f;
-static float last_qy = 0.0f;
-static float last_qz = 0.0f;
-
-// Fallback for East vector singularity
-static float last_ex = 1.0f, last_ey = 0.0f, last_ez = 0.0f;
+static float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
 
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
 static getEvents_t orig_getEvents = nullptr;
@@ -32,105 +27,83 @@ static getDefaultSensor_t orig_getDefaultSensor = nullptr;
 typedef ASensor const* (*getDefaultSensorEx_t)(ASensorManager*, int, bool);
 static getDefaultSensorEx_t orig_getDefaultSensorEx = nullptr;
 
-void compute_sensor_fusion(int64_t timestamp) {
+void compute_madgwick_vgyro(int64_t timestamp) {
+    if (last_timestamp == 0) {
+        last_timestamp = timestamp;
+        return;
+    }
+
+    float dt = (timestamp - last_timestamp) / 1000000000.0f; 
+    if (dt <= 0.001f || dt > 0.1f) { 
+        last_timestamp = timestamp;
+        return;
+    }
+    last_timestamp = timestamp;
+
     float ax = last_accel[0], ay = last_accel[1], az = last_accel[2];
     float mx = last_mag[0], my = last_mag[1], mz = last_mag[2];
 
-    // 1. Up Vector (Gravity)
-    float normA = sqrt(ax*ax + ay*ay + az*az);
-    if (normA < 0.001f) normA = 0.001f; 
-    float ux = ax / normA, uy = ay / normA, uz = az / normA;
+    // Normalize accelerometer measurement
+    float normA = sqrt(ax * ax + ay * ay + az * az);
+    if (normA == 0.0f) return; 
+    ax /= normA; ay /= normA; az /= normA;
 
-    // 2. East Vector (Magnetic cross Gravity)
-    float ex = my * uz - mz * uy;
-    float ey = mz * ux - mx * uz;
-    float ez = mx * uy - my * ux;
-    float normE = sqrt(ex*ex + ey*ey + ez*ez);
-    if (normE < 0.001f) {
-        ex = last_ex; ey = last_ey; ez = last_ez; 
-    } else {
-        ex /= normE; ey /= normE; ez /= normE;
-        last_ex = ex; last_ey = ey; last_ez = ez;
+    // Normalize magnetometer measurement
+    float normM = sqrt(mx * mx + my * my + mz * mz);
+    if (normM == 0.0f) return;
+    mx /= normM; my /= normM; mz /= normM;
+
+    // Reference direction of Earth's magnetic field
+    float hx = 2.0f * (mx * (0.5f - q2 * q2 - q3 * q3) + my * (q1 * q2 - q0 * q3) + mz * (q1 * q3 + q0 * q2));
+    float hy = 2.0f * (mx * (q1 * q2 + q0 * q3) + my * (0.5f - q1 * q1 - q3 * q3) + mz * (q2 * q3 - q0 * q1));
+    float bx = sqrt(hx * hx + hy * hy);
+    float bz = 2.0f * (mx * (q1 * q3 - q0 * q2) + my * (q2 * q3 + q0 * q1) + mz * (0.5f - q1 * q1 - q2 * q2));
+
+    // Gradient descent algorithm corrective step
+    float s0 = -_2q2 * (2.0f * q1 * q3 - _2q0 * q2 - ax) + _2q1 * (2.0f * q0 * q1 + _2q2 * q3 - ay) - _2bz * q2 * (_2bx * (0.5f - q2 * q2 - q3 * q3) + _2bz * (q1 * q3 - q0 * q2) - mx) + (-_2bx * q3 + _2bz * q1) * (_2bx * (q1 * q2 - q0 * q3) + _2bz * (q0 * q1 + q2 * q3) - my) + _2bx * q2 * (_2bx * (q0 * q2 + q1 * q3) + _2bz * (0.5f - q1 * q1 - q2 * q2) - mz);
+    float s1 = _2q3 * (2.0f * q1 * q3 - _2q0 * q2 - ax) + _2q0 * (2.0f * q0 * q1 + _2q2 * q3 - ay) - 4.0f * q1 * (1.0f - 2.0f * q1 * q1 - 2.0f * q2 * q2 - az) + _2bz * q3 * (_2bx * (0.5f - q2 * q2 - q3 * q3) + _2bz * (q1 * q3 - q0 * q2) - mx) + (_2bx * q2 + _2bz * q0) * (_2bx * (q1 * q2 - q0 * q3) + _2bz * (q0 * q1 + q2 * q3) - my) + (_2bx * q3 - _4bz * q1) * (_2bx * (q0 * q2 + q1 * q3) + _2bz * (0.5f - q1 * q1 - q2 * q2) - mz);
+    float s2 = -_2q0 * (2.0f * q1 * q3 - _2q0 * q2 - ax) + _2q3 * (2.0f * q0 * q1 + _2q2 * q3 - ay) - 4.0f * q2 * (1.0f - 2.0f * q1 * q1 - 2.0f * q2 * q2 - az) + (-_4bx * q2 - _2bz * q0) * (_2bx * (0.5f - q2 * q2 - q3 * q3) + _2bz * (q1 * q3 - q0 * q2) - mx) + (_2bx * q1 + _2bz * q3) * (_2bx * (q1 * q2 - q0 * q3) + _2bz * (q0 * q1 + q2 * q3) - my) + (_2bx * q0 - _4bz * q2) * (_2bx * (q0 * q2 + q1 * q3) + _2bz * (0.5f - q1 * q1 - q2 * q2) - mz);
+    float s3 = _2q1 * (2.0f * q1 * q3 - _2q0 * q2 - ax) + _2q2 * (2.0f * q0 * q1 + _2q2 * q3 - ay) + (-_4bx * q3 + _2bz * q1) * (_2bx * (0.5f - q2 * q2 - q3 * q3) + _2bz * (q1 * q3 - q0 * q2) - mx) + (-_2bx * q0 + _2bz * q2) * (_2bx * (q1 * q2 - q0 * q3) + _2bz * (q0 * q1 + q2 * q3) - my) + _2bx * q1 * (_2bx * (q0 * q2 + q1 * q3) + _2bz * (0.5f - q1 * q1 - q2 * q2) - mz);
+
+    // Normalize step magnitude
+    float normS = sqrt(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3);
+    if (normS > 0.0f) {
+        s0 /= normS; s1 /= normS; s2 /= normS; s3 /= normS;
     }
 
-    // 3. North Vector (Gravity cross East)
-    float nx = uy * ez - uz * ey;
-    float ny = uz * ex - ux * ez;
-    float nz = ux * ey - uy * ex;
+    // Backup current quaternion to calculate delta
+    float last_q0 = q0, last_q1 = q1, last_q2 = q2, last_q3 = q3;
 
-    // 4. Matrix to Quaternion Conversion (w, x, y, z)
-    float qw, qx, qy, qz;
-    float tr = ex + ny + uz; 
+    // Apply gradient descent step to find the new absolute orientation quaternion
+    q0 -= BETA * s0 * dt;
+    q1 -= BETA * s1 * dt;
+    q2 -= BETA * s2 * dt;
+    q3 -= BETA * s3 * dt;
 
-    if (tr > 0.0f) {
-        float S = sqrt(tr + 1.0f) * 2.0f; 
-        qw = 0.25f * S;
-        qx = (nz - uy) / S;
-        qy = (ux - ez) / S;
-        qz = (ey - nx) / S;
-    } else if ((ex > ny) && (ex > uz)) {
-        float S = sqrt(1.0f + ex - ny - uz) * 2.0f; 
-        qw = (nz - uy) / S;
-        qx = 0.25f * S;
-        qy = (nx + ey) / S;
-        qz = (ux + ez) / S;
-    } else if (ny > uz) {
-        float S = sqrt(1.0f + ny - ex - uz) * 2.0f; 
-        qw = (ux - ez) / S;
-        qx = (nx + ey) / S;
-        qy = 0.25f * S;
-        qz = (uy + nz) / S;
-    } else {
-        float S = sqrt(1.0f + uz - ex - ny) * 2.0f; 
-        qw = (ey - nx) / S;
-        qx = (ux + ez) / S;
-        qy = (uy + nz) / S;
-        qz = 0.25f * S;
+    // Normalize new quaternion
+    float normQ = sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+    q0 /= normQ; q1 /= normQ; q2 /= normQ; q3 /= normQ;
+
+    // Calculate Delta Quaternion (Hamiltonian Conjugate Product) to extract Virtual Gyro Rates
+    float dq0 = last_q0 * q0 + last_q1 * q1 + last_q2 * q2 + last_q3 * q3;
+    float dq1 = last_q0 * q1 - last_q1 * q0 - last_q2 * q3 + last_q3 * q2;
+    float dq2 = last_q0 * q2 + last_q1 * q3 - last_q2 * q0 - last_q3 * q1;
+    float dq3 = last_q0 * q3 - last_q1 * q2 + last_q2 * q1 - last_q3 * q0;
+
+    // Enforce shortest path
+    if (dq0 < 0.0f) {
+        dq1 = -dq1; dq2 = -dq2; dq3 = -dq3;
     }
 
-    // Normalize Quaternion
-    float qNorm = sqrt(qw*qw + qx*qx + qy*qy + qz*qz);
-    qw /= qNorm; qx /= qNorm; qy /= qNorm; qz /= qNorm;
+    // Convert pure quaternion derivative to rad/s (w = 2 * dq / dt)
+    float speed_x = (2.0f * dq1) / dt;
+    float speed_y = (2.0f * dq2) / dt;
+    float speed_z = (2.0f * dq3) / dt;
 
-    if (last_timestamp == 0) {
-        last_qw = qw; last_qx = qx; last_qy = qy; last_qz = qz;
-        last_timestamp = timestamp;
-        return;
-    }
-
-    float raw_dt = (timestamp - last_timestamp) / 1000000000.0f; 
-    if (raw_dt <= 0.001f || raw_dt > 0.1f) { 
-        last_timestamp = timestamp;
-        return;
-    }
-
-    // 5. Delta Quaternion (Inverse Last * Current)
-    float dw = last_qw * qw + last_qx * qx + last_qy * qy + last_qz * qz;
-    float dx = last_qw * qx - last_qx * qw - last_qy * qz + last_qz * qy;
-    float dy = last_qw * qy + last_qx * qz - last_qy * qw - last_qz * qx;
-    float dz = last_qw * qz - last_qx * qy + last_qy * qx - last_qz * qw;
-
-    // Enforce shortest rotational path
-    if (dw < 0.0f) {
-        dx = -dx; dy = -dy; dz = -dz;
-    }
-
-    // 6. Convert to pure rad/s
-    float speed_x = (2.0f * dx) / raw_dt;
-    float speed_y = (2.0f * dy) / raw_dt;
-    float speed_z = (2.0f * dz) / raw_dt;
-
-    // Noise gates
-    if (fabs(speed_x) < MAG_NOISE_GATE) speed_x = 0.0f;
-    if (fabs(speed_y) < MAG_NOISE_GATE) speed_y = 0.0f;
-    if (fabs(speed_z) < MAG_NOISE_GATE) speed_z = 0.0f;
-
-    output_gyro[0] = speed_x;
-    output_gyro[1] = speed_y;
-    output_gyro[2] = speed_z;
-
-    last_qw = qw; last_qx = qx; last_qy = qy; last_qz = qz;
-    last_timestamp = timestamp;
+    // Globally inverted outputs to match Unity's Right-Handed Camera mapping
+    output_gyro[0] = -speed_x;
+    output_gyro[1] = -speed_y;
+    output_gyro[2] = -speed_z;
 }
 
 ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent* events, size_t count) {
@@ -140,51 +113,29 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
         int64_t latest_ts = 0;
 
         for (ssize_t i = 0; i < actual_events; i++) {
-            
-            // Standard Calibrated Fallback
-            if (events[i].type == ASENSOR_TYPE_ACCELEROMETER) {
-                last_accel[0] = events[i].acceleration.v[0];
-                last_accel[1] = events[i].acceleration.v[1];
-                last_accel[2] = events[i].acceleration.v[2];
-                if (events[i].timestamp > latest_ts) latest_ts = events[i].timestamp;
-                fusion_needed = true;
-            } 
-            else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD) {
-                last_mag[0] = events[i].magnetic.v[0];
-                last_mag[1] = events[i].magnetic.v[1];
-                last_mag[2] = events[i].magnetic.v[2];
-                if (events[i].timestamp > latest_ts) latest_ts = events[i].timestamp;
-                fusion_needed = true;
-            } 
-            
-            // Raw Uncalibrated Accelerometer (Type 35)
-            else if (events[i].type == 35) {
+            if (events[i].type == 35 || events[i].type == ASENSOR_TYPE_ACCELEROMETER) {
                 last_accel[0] = events[i].data[0];
                 last_accel[1] = events[i].data[1];
                 last_accel[2] = events[i].data[2];
                 if (events[i].timestamp > latest_ts) latest_ts = events[i].timestamp;
                 fusion_needed = true;
-                events[i].type = ASENSOR_TYPE_ACCELEROMETER; 
-            }
-            
-            // Raw Uncalibrated Compass (Type 14)
-            else if (events[i].type == 14) {
+                if (events[i].type == 35) events[i].type = ASENSOR_TYPE_ACCELEROMETER; 
+            } 
+            else if (events[i].type == 14 || events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD) {
                 last_mag[0] = events[i].data[0];
                 last_mag[1] = events[i].data[1];
                 last_mag[2] = events[i].data[2];
                 if (events[i].timestamp > latest_ts) latest_ts = events[i].timestamp;
                 fusion_needed = true;
-                events[i].type = ASENSOR_TYPE_MAGNETIC_FIELD; 
+                if (events[i].type == 14) events[i].type = ASENSOR_TYPE_MAGNETIC_FIELD; 
             }
-            
             else if (events[i].type == ASENSOR_TYPE_GYROSCOPE) {
                 events[i].vector.x = output_gyro[0]; 
                 events[i].vector.y = output_gyro[1]; 
                 events[i].vector.z = output_gyro[2]; 
             }
         }
-
-        if (fusion_needed && latest_ts > 0) compute_sensor_fusion(latest_ts);
+        if (fusion_needed && latest_ts > 0) compute_madgwick_vgyro(latest_ts);
     }
     return actual_events;
 }
