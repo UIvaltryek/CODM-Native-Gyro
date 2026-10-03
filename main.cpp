@@ -6,14 +6,19 @@
 #include "zygisk.hpp"
 
 // --- TUNABLE MIDDLEMAN PARAMETERS ---
-// Pushes the signal forward aggressively to cancel MediaTek's low-pass delay
 static const float ANTI_LAG_BOOST = 1.2f; 
-// The exact mathematical suppression threshold of the stock OS
 static const float MTK_DEADZONE_THRESHOLD = 0.15f; 
+// Your exact proposed baseline, kept just under the engine threshold
+static const float BASELINE_BIAS = 0.149999f; 
 
 static float output_gyro[3] = {0.0f, 0.0f, 0.0f};
 static float last_stock_gyro[3] = {0.0f, 0.0f, 0.0f};
 static int64_t last_timestamp = 0;
+
+// Memory variables to track the last known direction of each axis
+static float last_sign_x = 1.0f;
+static float last_sign_y = 1.0f;
+static float last_sign_z = 1.0f;
 
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
 static getEvents_t orig_getEvents = nullptr;
@@ -42,24 +47,30 @@ void reshape_stock_gyro(float stock_x, float stock_y, float stock_z, int64_t tim
     float boosted_y = stock_y + (accel_y * dt * ANTI_LAG_BOOST);
     float boosted_z = stock_z + (accel_z * dt * ANTI_LAG_BOOST);
 
-    // --- 2. ANTI-DEADZONE INJECTION (ADZ) ---
-    // Floor lowered to 1e-6 to catch heavily suppressed floats before they hit absolute zero
-    if (fabs(stock_x) > 0.000001f && fabs(stock_x) < MTK_DEADZONE_THRESHOLD) {
-        float sign_x = (stock_x > 0.0f) ? 1.0f : -1.0f;
-        boosted_x = (sign_x * MTK_DEADZONE_THRESHOLD) + (stock_x * 2.0f);
+    // --- 2. DIRECTIONAL MEMORY TRACKING ---
+    // Update the memory sign if there is active directional movement
+    if (boosted_x > 0.000001f) last_sign_x = 1.0f;
+    else if (boosted_x < -0.000001f) last_sign_x = -1.0f;
+
+    if (boosted_y > 0.000001f) last_sign_y = 1.0f;
+    else if (boosted_y < -0.000001f) last_sign_y = -1.0f;
+
+    if (boosted_z > 0.000001f) last_sign_z = 1.0f;
+    else if (boosted_z < -0.000001f) last_sign_z = -1.0f;
+
+    // --- 3. DYNAMIC BASELINE INJECTION ---
+    // If movement is trapped inside the deadzone, inject the directional baseline bias
+    if (fabs(boosted_x) < MTK_DEADZONE_THRESHOLD) {
+        boosted_x = (last_sign_x * BASELINE_BIAS) + (boosted_x * 2.0f);
     }
-    
-    if (fabs(stock_y) > 0.000001f && fabs(stock_y) < MTK_DEADZONE_THRESHOLD) {
-        float sign_y = (stock_y > 0.0f) ? 1.0f : -1.0f;
-        boosted_y = (sign_y * MTK_DEADZONE_THRESHOLD) + (stock_y * 2.0f);
+    if (fabs(boosted_y) < MTK_DEADZONE_THRESHOLD) {
+        boosted_y = (last_sign_y * BASELINE_BIAS) + (boosted_y * 2.0f);
     }
-    
-    if (fabs(stock_z) > 0.000001f && fabs(stock_z) < MTK_DEADZONE_THRESHOLD) {
-        float sign_z = (stock_z > 0.0f) ? 1.0f : -1.0f;
-        boosted_z = (sign_z * MTK_DEADZONE_THRESHOLD) + (stock_z * 2.0f);
+    if (fabs(boosted_z) < MTK_DEADZONE_THRESHOLD) {
+        boosted_z = (last_sign_z * BASELINE_BIAS) + (boosted_z * 2.0f);
     }
 
-    // Direct hardware-to-engine output (zero smoothing to eliminate phase lag)
+    // Direct hardware-to-engine output
     output_gyro[0] = boosted_x;
     output_gyro[1] = boosted_y;
     output_gyro[2] = boosted_z;
@@ -74,8 +85,6 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
     ssize_t actual_events = orig_getEvents(queue, events, count);
     if (actual_events > 0) {
         for (ssize_t i = 0; i < actual_events; i++) {
-            
-            // Intercept only the Calibrated Stock Gyroscope (Type 4)
             if (events[i].type == ASENSOR_TYPE_GYROSCOPE) {
                 reshape_stock_gyro(events[i].vector.x, events[i].vector.y, events[i].vector.z, events[i].timestamp);
                 events[i].vector.x = output_gyro[0]; 
@@ -88,7 +97,6 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
 }
 
 int hook_ASensorEventQueue_setEventRate(ASensorEventQueue* queue, ASensor const* sensor, int32_t usec) {
-    // Override the game's requested delay, force fastest possible polling rate
     return orig_setEventRate(queue, sensor, 0); 
 }
 
