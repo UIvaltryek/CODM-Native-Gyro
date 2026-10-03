@@ -59,6 +59,16 @@ void compute_madgwick_vgyro(int64_t timestamp) {
     float bx = sqrt(hx * hx + hy * hy);
     float bz = 2.0f * (mx * (q1 * q3 - q0 * q2) + my * (q2 * q3 + q0 * q1) + mz * (0.5f - q1 * q1 - q2 * q2));
 
+    // Auxiliary variables to avoid repeated arithmetic
+    float _2q0 = 2.0f * q0;
+    float _2q1 = 2.0f * q1;
+    float _2q2 = 2.0f * q2;
+    float _2q3 = 2.0f * q3;
+    float _2bx = 2.0f * bx;
+    float _2bz = 2.0f * bz;
+    float _4bx = 4.0f * bx;
+    float _4bz = 4.0f * bz;
+
     // Gradient descent algorithm corrective step
     float s0 = -_2q2 * (2.0f * q1 * q3 - _2q0 * q2 - ax) + _2q1 * (2.0f * q0 * q1 + _2q2 * q3 - ay) - _2bz * q2 * (_2bx * (0.5f - q2 * q2 - q3 * q3) + _2bz * (q1 * q3 - q0 * q2) - mx) + (-_2bx * q3 + _2bz * q1) * (_2bx * (q1 * q2 - q0 * q3) + _2bz * (q0 * q1 + q2 * q3) - my) + _2bx * q2 * (_2bx * (q0 * q2 + q1 * q3) + _2bz * (0.5f - q1 * q1 - q2 * q2) - mz);
     float s1 = _2q3 * (2.0f * q1 * q3 - _2q0 * q2 - ax) + _2q0 * (2.0f * q0 * q1 + _2q2 * q3 - ay) - 4.0f * q1 * (1.0f - 2.0f * q1 * q1 - 2.0f * q2 * q2 - az) + _2bz * q3 * (_2bx * (0.5f - q2 * q2 - q3 * q3) + _2bz * (q1 * q3 - q0 * q2) - mx) + (_2bx * q2 + _2bz * q0) * (_2bx * (q1 * q2 - q0 * q3) + _2bz * (q0 * q1 + q2 * q3) - my) + (_2bx * q3 - _4bz * q1) * (_2bx * (q0 * q2 + q1 * q3) + _2bz * (0.5f - q1 * q1 - q2 * q2) - mz);
