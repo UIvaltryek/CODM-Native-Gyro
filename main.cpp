@@ -9,8 +9,7 @@
 static const float MAG_NOISE_GATE = 0.005f; 
 static const float SENSITIVITY = 1.0f;
 
-// --- HARDCODED FACTORY BIAS ---
-// Extracted from CPU X to permanently center the uncalibrated magnetic sphere
+// Factory Bias for MT6835 - Permanently centers the mathematical origin[span_1](start_span)[span_1](end_span)
 static const float HARD_IRON_X = 93.76f;
 static const float HARD_IRON_Y = -29.09f;
 static const float HARD_IRON_Z = 967.01f;
@@ -64,6 +63,7 @@ static float last_accel[3] = {0.0f, 0.0f, 9.81f};
 static float last_mag[3] = {0.0f, 1.0f, 0.0f};
 static int64_t last_timestamp = 0;
 
+static Vec3 last_E = {1.0f, 0.0f, 0.0f}; // Fallback vector
 static Quat last_q = {1.0f, 0.0f, 0.0f, 0.0f};
 static Vec3 final_gyro = {0.0f, 0.0f, 0.0f};
 
@@ -76,8 +76,16 @@ void compute_sensor_fusion(int64_t timestamp) {
     Vec3 A = normalize_vec({last_accel[0], last_accel[1], last_accel[2]});
     Vec3 M = normalize_vec({last_mag[0], last_mag[1], last_mag[2]});
 
-    // Orthogonal Basis
-    Vec3 E = normalize_vec(cross_product(M, A));
+    // SINGULARITY GUARD: Prevent cross-product collapse at 90 degrees
+    Vec3 E = cross_product(M, A);
+    float len_E = sqrt(E.x*E.x + E.y*E.y + E.z*E.z);
+    if (len_E > 0.001f) {
+        E.x /= len_E; E.y /= len_E; E.z /= len_E;
+        last_E = E; // Save a healthy East vector
+    } else {
+        E = last_E; // Inject fallback if Gravity and North become perfectly parallel
+    }
+    
     Vec3 N = normalize_vec(cross_product(A, E));
 
     Quat current_q = matrix_to_quat(E, N, A);
@@ -101,23 +109,21 @@ void compute_sensor_fusion(int64_t timestamp) {
         current_q.y = -current_q.y; current_q.z = -current_q.z;
     }
 
-    // Inverse of previous frame
     Quat inv_last = { last_q.w, -last_q.x, -last_q.y, -last_q.z };
 
-    // Local Frame Delta = inv_last * current_q
+    // LOCAL FRAME DELTA: Forces angular velocity onto the physical device casing
     Quat dq = {
-        inv_last.w*current_q.w - inv_last.x*current_q.x - inv_last.y*current_q.y - inv_last.z*current_q.z,
-        inv_last.w*current_q.x + inv_last.x*current_q.w + inv_last.y*current_q.z - inv_last.z*current_q.y,
-        inv_last.w*current_q.y - inv_last.x*current_q.z + inv_last.y*current_q.w + inv_last.z*current_q.x,
-        inv_last.w*current_q.z + inv_last.x*current_q.y - inv_last.y*current_q.x + inv_last.z*current_q.w
+        current_q.w*inv_last.w - current_q.x*inv_last.x - current_q.y*inv_last.y - current_q.z*inv_last.z,
+        current_q.w*inv_last.x + current_q.x*inv_last.w + current_q.y*inv_last.z - current_q.z*inv_last.y,
+        current_q.w*inv_last.y - current_q.x*inv_last.z + current_q.y*inv_last.w + current_q.z*inv_last.x,
+        current_q.w*inv_last.z + current_q.x*inv_last.y - current_q.y*inv_last.x + current_q.z*inv_last.w
     };
 
-    // Extract velocity. Negated to match Android's right-hand coordinate system.
+    // Extract velocity. Negated to match Android's Right-Hand Coordinate Rule.
     float raw_x = -(2.0f * dq.x) / dt;
     float raw_y = -(2.0f * dq.y) / dt;
     float raw_z = -(2.0f * dq.z) / dt;
 
-    // Direct output
     final_gyro.x = (fabs(raw_x) > MAG_NOISE_GATE) ? raw_x * SENSITIVITY : 0.0f;
     final_gyro.y = (fabs(raw_y) > MAG_NOISE_GATE) ? raw_y * SENSITIVITY : 0.0f;
     final_gyro.z = (fabs(raw_z) > MAG_NOISE_GATE) ? raw_z * SENSITIVITY : 0.0f;
@@ -141,16 +147,14 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                 fusion_needed = true;
             } 
             else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || events[i].type == 14) {
-                // Permanently subtract factory offsets to mathematically center the sphere
+                // Instantly center the sphere using exact hardware bias[span_2](start_span)[span_2](end_span)
                 last_mag[0] = events[i].uncalibrated_magnetic.x_uncalib - HARD_IRON_X;
                 last_mag[1] = events[i].uncalibrated_magnetic.y_uncalib - HARD_IRON_Y;
                 last_mag[2] = events[i].uncalibrated_magnetic.z_uncalib - HARD_IRON_Z;
-                
                 if (events[i].timestamp > latest_ts) latest_ts = events[i].timestamp;
                 fusion_needed = true;
             } 
             else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD) {
-                // Fallback route
                 last_mag[0] = events[i].magnetic.v[0];
                 last_mag[1] = events[i].magnetic.v[1];
                 last_mag[2] = events[i].magnetic.v[2];
@@ -164,6 +168,7 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
             }
         }
 
+        // Synchronous 200Hz Loop Execution
         if (fusion_needed && latest_ts > 0) {
             compute_sensor_fusion(latest_ts);
         }
