@@ -9,6 +9,12 @@
 static const float MAG_NOISE_GATE = 0.005f; 
 static const float SENSITIVITY = 1.0f;
 
+// --- HARDCODED FACTORY BIAS ---
+// Extracted from CPU X to permanently center the uncalibrated magnetic sphere
+static const float HARD_IRON_X = 93.76f;
+static const float HARD_IRON_Y = -29.09f;
+static const float HARD_IRON_Z = 967.01f;
+
 struct Vec3 { float x, y, z; };
 struct Quat { float w, x, y, z; };
 
@@ -61,10 +67,6 @@ static int64_t last_timestamp = 0;
 static Quat last_q = {1.0f, 0.0f, 0.0f, 0.0f};
 static Vec3 final_gyro = {0.0f, 0.0f, 0.0f};
 
-// Static Bias Lock
-static bool bias_locked = false;
-static float locked_bias[3] = {0.0f, 0.0f, 0.0f};
-
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
 static getEvents_t orig_getEvents = nullptr;
 typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
@@ -102,7 +104,7 @@ void compute_sensor_fusion(int64_t timestamp) {
     // Inverse of previous frame
     Quat inv_last = { last_q.w, -last_q.x, -last_q.y, -last_q.z };
 
-    // THE FIX: Local Frame Delta = inv_last * current_q
+    // Local Frame Delta = inv_last * current_q
     Quat dq = {
         inv_last.w*current_q.w - inv_last.x*current_q.x - inv_last.y*current_q.y - inv_last.z*current_q.z,
         inv_last.w*current_q.x + inv_last.x*current_q.w + inv_last.y*current_q.z - inv_last.z*current_q.y,
@@ -115,7 +117,7 @@ void compute_sensor_fusion(int64_t timestamp) {
     float raw_y = -(2.0f * dq.y) / dt;
     float raw_z = -(2.0f * dq.z) / dt;
 
-    // Direct output (no EMA filters)
+    // Direct output
     final_gyro.x = (fabs(raw_x) > MAG_NOISE_GATE) ? raw_x * SENSITIVITY : 0.0f;
     final_gyro.y = (fabs(raw_y) > MAG_NOISE_GATE) ? raw_y * SENSITIVITY : 0.0f;
     final_gyro.z = (fabs(raw_z) > MAG_NOISE_GATE) ? raw_z * SENSITIVITY : 0.0f;
@@ -139,23 +141,16 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                 fusion_needed = true;
             } 
             else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || events[i].type == 14) {
-                // Lock hard-iron OS bias permanently to prevent mid-game warping
-                if (!bias_locked && (events[i].uncalibrated_magnetic.x_bias != 0.0f || events[i].uncalibrated_magnetic.y_bias != 0.0f)) {
-                    locked_bias[0] = events[i].uncalibrated_magnetic.x_bias;
-                    locked_bias[1] = events[i].uncalibrated_magnetic.y_bias;
-                    locked_bias[2] = events[i].uncalibrated_magnetic.z_bias;
-                    bias_locked = true;
-                }
-                
-                // Subtract bias to perfectly center the vector sphere
-                last_mag[0] = events[i].uncalibrated_magnetic.x_uncalib - locked_bias[0];
-                last_mag[1] = events[i].uncalibrated_magnetic.y_uncalib - locked_bias[1];
-                last_mag[2] = events[i].uncalibrated_magnetic.z_uncalib - locked_bias[2];
+                // Permanently subtract factory offsets to mathematically center the sphere
+                last_mag[0] = events[i].uncalibrated_magnetic.x_uncalib - HARD_IRON_X;
+                last_mag[1] = events[i].uncalibrated_magnetic.y_uncalib - HARD_IRON_Y;
+                last_mag[2] = events[i].uncalibrated_magnetic.z_uncalib - HARD_IRON_Z;
                 
                 if (events[i].timestamp > latest_ts) latest_ts = events[i].timestamp;
                 fusion_needed = true;
             } 
             else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD) {
+                // Fallback route
                 last_mag[0] = events[i].magnetic.v[0];
                 last_mag[1] = events[i].magnetic.v[1];
                 last_mag[2] = events[i].magnetic.v[2];
