@@ -7,44 +7,38 @@
 
 // --- TUNABLE PARAMETERS ---
 static const float SENSITIVITY = 1.0f; 
-static const float NOISE_GATE = 0.005f;
+static const float NOISE_GATE = 0.003f;
+static const float FILTER_COEFFICIENT = 0.85f; 
 
-// Low-pass filter coefficient for final angular rates[span_13](start_span)[span_13](end_span)
-static const float ALPHA_GYRO = 0.2f; 
-// Low-pass for incoming raw sensor noise to mitigate linear acceleration artifacts[span_14](start_span)[span_14](end_span)[span_15](start_span)[span_15](end_span)[span_16](start_span)[span_16](end_span)
-static const float ALPHA_SENSOR = 0.2f; 
-
-// Mandatory hard-iron calibration biases for MT6835[span_17](start_span)[span_17](end_span)
+// Exact CPU X Factory Biases for MT6835
 static const float HARD_IRON_X = 93.76f;
 static const float HARD_IRON_Y = -29.09f;
 static const float HARD_IRON_Z = 967.01f;
 
-struct Quat { float x, y, z, w; };
-
+// --- STATE VARIABLES ---
 static float accelReading[3] = {0.0f, 0.0f, 9.81f};
 static float magReading[3] = {0.0f, 1.0f, 0.0f};
 
-// State trackers for the differentiation step[span_18](start_span)[span_18](end_span)
-static Quat prev_q = {0.0f, 0.0f, 0.0f, 0.0f};
+static float lastRotationMatrix[9] = {1,0,0, 0,1,0, 0,0,1};
 static bool isInitialized = false;
 static int64_t last_ts = 0;
 
-static float prev_gyro[3] = {0.0f, 0.0f, 0.0f};
+static float smooth_gyro[3] = {0.0f, 0.0f, 0.0f};
 static float final_gyro[3] = {0.0f, 0.0f, 0.0f};
-static float final_quat[4] = {0.0f, 0.0f, 0.0f, 1.0f};
 
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
 static getEvents_t orig_getEvents = nullptr;
 typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
 static setEventRate_t orig_setEventRate = nullptr;
 
-void lowPass(float input[3], float output[3], float alpha) {
+// Hardware Noise Filter (Reduced filtering for faster response)
+void lowPass(float input[3], float output[3]) {
+    float alpha = 0.6f; // Changed from 0.2f to 0.6f
     for (int i = 0; i < 3; i++) {
         output[i] = output[i] + alpha * (input[i] - output[i]);
     }
 }
 
-// 1. Compute Orientation Matrix (TRIAD algorithm)[span_19](start_span)[span_19](end_span)[span_20](start_span)[span_20](end_span)
 bool getRotationMatrix(float R[9], float gravity[3], float geomagnetic[3]) {
     float Ax = gravity[0], Ay = gravity[1], Az = gravity[2];
     float normA = sqrt(Ax*Ax + Ay*Ay + Az*Az);
@@ -68,67 +62,13 @@ bool getRotationMatrix(float R[9], float gravity[3], float geomagnetic[3]) {
     return true;
 }
 
-// 2. Convert to Quaternion to avoid gimbal lock[span_21](start_span)[span_21](end_span)
-Quat matrixToQuaternion(float R[9]) {
-    Quat q;
-    float trace = R[0] + R[4] + R[8];
-    if (trace > 0.0f) {
-        float s = sqrt(trace + 1.0f) * 2.0f;
-        q.w = 0.25f * s;         
-        q.x = (R[7] - R[5]) / s; 
-        q.y = (R[2] - R[6]) / s; 
-        q.z = (R[3] - R[1]) / s; 
-    } else if ((R[0] > R[4]) && (R[0] > R[8])) {
-        float s = sqrt(1.0f + R[0] - R[4] - R[8]) * 2.0f;
-        q.w = (R[7] - R[5]) / s;
-        q.x = 0.25f * s;
-        q.y = (R[3] + R[1]) / s;
-        q.z = (R[2] + R[6]) / s;
-    } else if (R[4] > R[8]) {
-        float s = sqrt(1.0f + R[4] - R[0] - R[8]) * 2.0f;
-        q.w = (R[2] - R[6]) / s;
-        q.x = (R[3] + R[1]) / s;
-        q.y = 0.25f * s;
-        q.z = (R[7] + R[5]) / s;
-    } else {
-        float s = sqrt(1.0f + R[8] - R[0] - R[4]) * 2.0f;
-        q.w = (R[3] - R[1]) / s;
-        q.x = (R[2] + R[6]) / s;
-        q.y = (R[7] + R[5]) / s;
-        q.z = 0.25f * s;
-    }
-    
-    // Ensure unit quaternion length
-    float norm = sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
-    q.x /= norm; q.y /= norm; q.z /= norm; q.w /= norm;
-    return q;
-}
-
-// Quaternion multiplication helper[span_22](start_span)[span_22](end_span)
-Quat q_mult(Quat q1, Quat q2) {
-    Quat result;
-    result.w = q1.w*q2.w - q1.x*q2.x - q1.y*q2.y - q1.z*q2.z;
-    result.x = q1.w*q2.x + q1.x*q2.w + q1.y*q2.z - q1.z*q2.y;
-    result.y = q1.w*q2.y - q1.x*q2.z + q1.y*q2.w + q1.z*q2.x;
-    result.z = q1.w*q2.z + q1.x*q2.y - q1.y*q2.x + q1.z*q2.w;
-    return result;
-}
-
 void compute_sensor_fusion(int64_t ts) {
-    float R[9];
-    bool success = getRotationMatrix(R, accelReading, magReading);
+    float C[9];
+    bool success = getRotationMatrix(C, accelReading, magReading);
 
     if (success) {
-        Quat current_q = matrixToQuaternion(R);
-        
-        // Export to Android Rotation Vector formats
-        final_quat[0] = current_q.x;
-        final_quat[1] = current_q.y;
-        final_quat[2] = current_q.z;
-        final_quat[3] = current_q.w;
-
-        if (!isInitialized || last_ts == 0) {
-            prev_q = current_q;
+        if (!isInitialized) {
+            memcpy(lastRotationMatrix, C, sizeof(float) * 9);
             isInitialized = true;
             last_ts = ts;
             return;
@@ -137,45 +77,36 @@ void compute_sensor_fusion(int64_t ts) {
         float dt = (ts - last_ts) / 1000000000.0f;
         if (dt > 0.001f && dt < 0.1f) {
             
-            // Shortest path validation to prevent math flips
-            float dot = current_q.x*prev_q.x + current_q.y*prev_q.y + current_q.z*prev_q.z + current_q.w*prev_q.w;
-            if (dot < 0.0f) {
-                current_q.x = -current_q.x; current_q.y = -current_q.y; 
-                current_q.z = -current_q.z; current_q.w = -current_q.w;
-            }
+            float L[9];
+            memcpy(L, lastRotationMatrix, sizeof(float) * 9);
+            float dR[9];
 
-            // 3. Compute Quaternion derivative (dq = (current_q - prev_q) / dt)[span_23](start_span)[span_23](end_span)[span_24](start_span)[span_24](end_span)
-            Quat dq;
-            dq.x = (current_q.x - prev_q.x) / dt;
-            dq.y = (current_q.y - prev_q.y) / dt;
-            dq.z = (current_q.z - prev_q.z) / dt;
-            dq.w = (current_q.w - prev_q.w) / dt;
-
-            // Calculate inverse of previous quaternion[span_25](start_span)[span_25](end_span)
-            Quat q_inv = {-prev_q.x, -prev_q.y, -prev_q.z, prev_q.w};
-
-            // 4. Calculate raw angular velocity (w = 2 * q_inv * dq)[span_26](start_span)[span_26](end_span)[span_27](start_span)[span_27](end_span)
-            Quat w_q = q_mult(q_inv, dq);
+            dR[0] = L[0]*C[0] + L[3]*C[3] + L[6]*C[6];
+            dR[1] = L[0]*C[1] + L[3]*C[4] + L[6]*C[7];
+            dR[2] = L[0]*C[2] + L[3]*C[5] + L[6]*C[8];
             
-            float raw_gyro[3] = {
-                2.0f * w_q.x,
-                2.0f * w_q.y,
-                2.0f * w_q.z
-            };
+            dR[3] = L[1]*C[0] + L[4]*C[3] + L[7]*C[6];
+            dR[4] = L[1]*C[1] + L[4]*C[4] + L[7]*C[7];
+            dR[5] = L[1]*C[2] + L[4]*C[5] + L[7]*C[8];
+            
+            dR[6] = L[2]*C[0] + L[5]*C[3] + L[8]*C[6];
+            dR[7] = L[2]*C[1] + L[5]*C[4] + L[8]*C[7];
+            dR[8] = L[2]*C[2] + L[5]*C[5] + L[8]*C[8];
 
-            // 5. Apply low-pass filter to smooth out derivative noise[span_28](start_span)[span_28](end_span)[span_29](start_span)[span_29](end_span)
-            prev_gyro[0] = (ALPHA_GYRO * raw_gyro[0]) + ((1.0f - ALPHA_GYRO) * prev_gyro[0]);
-            prev_gyro[1] = (ALPHA_GYRO * raw_gyro[1]) + ((1.0f - ALPHA_GYRO) * prev_gyro[1]);
-            prev_gyro[2] = (ALPHA_GYRO * raw_gyro[2]) + ((1.0f - ALPHA_GYRO) * prev_gyro[2]);
+            float raw_gyro_x = (dR[7] - dR[5]) / (2.0f * dt); 
+            float raw_gyro_y = (dR[2] - dR[6]) / (2.0f * dt); 
+            float raw_gyro_z = (dR[3] - dR[1]) / (2.0f * dt); 
 
-            // Final output mapping with noise gate
-            final_gyro[0] = (fabs(prev_gyro[0]) > NOISE_GATE) ? prev_gyro[0] * SENSITIVITY : 0.0f;
-            final_gyro[1] = (fabs(prev_gyro[1]) > NOISE_GATE) ? prev_gyro[1] * SENSITIVITY : 0.0f;
-            final_gyro[2] = (fabs(prev_gyro[2]) > NOISE_GATE) ? prev_gyro[2] * SENSITIVITY : 0.0f;
+            smooth_gyro[0] = (FILTER_COEFFICIENT * smooth_gyro[0]) + ((1.0f - FILTER_COEFFICIENT) * raw_gyro_x);
+            smooth_gyro[1] = (FILTER_COEFFICIENT * smooth_gyro[1]) + ((1.0f - FILTER_COEFFICIENT) * raw_gyro_y);
+            smooth_gyro[2] = (FILTER_COEFFICIENT * smooth_gyro[2]) + ((1.0f - FILTER_COEFFICIENT) * raw_gyro_z);
+
+            final_gyro[0] = (fabs(smooth_gyro[0]) > NOISE_GATE) ? smooth_gyro[0] * SENSITIVITY : 0.0f;
+            final_gyro[1] = (fabs(smooth_gyro[1]) > NOISE_GATE) ? smooth_gyro[1] * SENSITIVITY : 0.0f;
+            final_gyro[2] = (fabs(smooth_gyro[2]) > NOISE_GATE) ? smooth_gyro[2] * SENSITIVITY : 0.0f;
         }
         
-        // Save states for next step[span_30](start_span)[span_30](end_span)
-        prev_q = current_q;
+        memcpy(lastRotationMatrix, C, sizeof(float) * 9);
         last_ts = ts;
     }
 }
@@ -188,7 +119,7 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
 
         for (ssize_t i = 0; i < actual_events; i++) {
             if (events[i].type == ASENSOR_TYPE_ACCELEROMETER) {
-                lowPass(events[i].acceleration.v, accelReading, ALPHA_SENSOR);
+                lowPass(events[i].acceleration.v, accelReading);
                 latest_ts = events[i].timestamp;
                 fusion_ready = true;
             } 
@@ -198,29 +129,19 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                     events[i].uncalibrated_magnetic.y_uncalib - HARD_IRON_Y,
                     events[i].uncalibrated_magnetic.z_uncalib - HARD_IRON_Z
                 };
-                lowPass(raw_mag, magReading, ALPHA_SENSOR);
+                lowPass(raw_mag, magReading);
                 if (!fusion_ready) latest_ts = events[i].timestamp; 
                 fusion_ready = true;
             } 
             else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD) {
-                lowPass(events[i].magnetic.v, magReading, ALPHA_SENSOR);
+                lowPass(events[i].magnetic.v, magReading);
                 if (!fusion_ready) latest_ts = events[i].timestamp;
                 fusion_ready = true;
             } 
-            
-            // Overwrite ALL Gyro and Rotation Vector Events to ensure CoD Mobile uses our clean math
-            else if (events[i].type == ASENSOR_TYPE_GYROSCOPE || events[i].type == 4) {
+            else if (events[i].type == ASENSOR_TYPE_GYROSCOPE) {
                 events[i].vector.x = final_gyro[0]; 
                 events[i].vector.y = final_gyro[1]; 
                 events[i].vector.z = final_gyro[2]; 
-            }
-            else if (events[i].type == ASENSOR_TYPE_ROTATION_VECTOR || 
-                     events[i].type == ASENSOR_TYPE_GAME_ROTATION_VECTOR || 
-                     events[i].type == 11 || events[i].type == 15) {
-                events[i].data[0] = final_quat[0]; // x
-                events[i].data[1] = final_quat[1]; // y
-                events[i].data[2] = final_quat[2]; // z
-                events[i].data[3] = final_quat[3]; // w
             }
         }
 
@@ -239,9 +160,13 @@ void install_hook() {
     void* libandroid = dlopen("libandroid.so", RTLD_NOW);
     if (libandroid) {
         void* target_get = dlsym(libandroid, "ASensorEventQueue_getEvents");
-        if (target_get) DobbyHook(target_get, (dobby_dummy_func_t)hook_ASensorEventQueue_getEvents, (dobby_dummy_func_t*)&orig_getEvents);
+        if (target_get) {
+            DobbyHook(target_get, (dobby_dummy_func_t)hook_ASensorEventQueue_getEvents, (dobby_dummy_func_t*)&orig_getEvents);
+        }
         void* target_rate = dlsym(libandroid, "ASensorEventQueue_setEventRate");
-        if (target_rate) DobbyHook(target_rate, (dobby_dummy_func_t)hook_ASensorEventQueue_setEventRate, (dobby_dummy_func_t*)&orig_setEventRate);
+        if (target_rate) {
+            DobbyHook(target_rate, (dobby_dummy_func_t)hook_ASensorEventQueue_setEventRate, (dobby_dummy_func_t*)&orig_setEventRate);
+        }
     }
 }
 
