@@ -9,16 +9,18 @@
 static const float MAG_NOISE_GATE = 0.005f; 
 static const float SENSITIVITY = 1.0f;
 
-// Factory Bias for MT6835 - Permanently centers the mathematical origin[span_1](start_span)[span_1](end_span)
+// Factory Bias for MT6835 - Permanently centers the mathematical origin[span_15](start_span)[span_15](end_span)
 static const float HARD_IRON_X = 93.76f;
 static const float HARD_IRON_Y = -29.09f;
 static const float HARD_IRON_Z = 967.01f;
 
 struct Vec3 { float x, y, z; };
-struct Quat { float w, x, y, z; };
 
 Vec3 cross_product(Vec3 a, Vec3 b) {
     return { a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x };
+}
+float dot_product(Vec3 a, Vec3 b) {
+    return a.x*b.x + a.y*b.y + a.z*b.z;
 }
 Vec3 normalize_vec(Vec3 v) {
     float len = sqrt(v.x*v.x + v.y*v.y + v.z*v.z);
@@ -26,45 +28,13 @@ Vec3 normalize_vec(Vec3 v) {
     return { v.x/len, v.y/len, v.z/len };
 }
 
-Quat matrix_to_quat(Vec3 E, Vec3 N, Vec3 A) {
-    Quat q;
-    float trace = E.x + N.y + A.z;
-    if (trace > 0.0f) {
-        float s = sqrt(trace + 1.0f) * 2.0f;
-        q.w = 0.25f * s;
-        q.x = (N.z - A.y) / s;
-        q.y = (A.x - E.z) / s;
-        q.z = (E.y - N.x) / s;
-    } else if ((E.x > N.y) && (E.x > A.z)) {
-        float s = sqrt(1.0f + E.x - N.y - A.z) * 2.0f;
-        q.w = (N.z - A.y) / s;
-        q.x = 0.25f * s;
-        q.y = (N.x + E.y) / s;
-        q.z = (A.x + E.z) / s;
-    } else if (N.y > A.z) {
-        float s = sqrt(1.0f + N.y - E.x - A.z) * 2.0f;
-        q.w = (A.x - E.z) / s;
-        q.x = (N.x + E.y) / s;
-        q.y = 0.25f * s;
-        q.z = (A.y + N.z) / s;
-    } else {
-        float s = sqrt(1.0f + A.z - E.x - N.y) * 2.0f;
-        q.w = (E.y - N.x) / s;
-        q.x = (A.x + E.z) / s;
-        q.y = (A.y + N.z) / s;
-        q.z = 0.25f * s;
-    }
-    float len = sqrt(q.w*q.w + q.x*q.x + q.y*q.y + q.z*q.z);
-    return { q.w/len, q.x/len, q.y/len, q.z/len };
-}
-
 // Memory States
 static float last_accel[3] = {0.0f, 0.0f, 9.81f};
 static float last_mag[3] = {0.0f, 1.0f, 0.0f};
 static int64_t last_timestamp = 0;
 
-static Vec3 last_E = {1.0f, 0.0f, 0.0f}; // Fallback vector for 90-degree parallel singularities
-static Quat last_q = {1.0f, 0.0f, 0.0f, 0.0f};
+static Vec3 last_A = {0.0f, 1.0f, 0.0f};
+static Vec3 last_E = {1.0f, 0.0f, 0.0f};
 static Vec3 final_gyro = {0.0f, 0.0f, 0.0f};
 
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
@@ -73,27 +43,21 @@ typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
 static setEventRate_t orig_setEventRate = nullptr;
 
 void compute_sensor_fusion(int64_t timestamp) {
+    // A is Gravity (Global World Up Axis)
     Vec3 A = normalize_vec({last_accel[0], last_accel[1], last_accel[2]});
     Vec3 M = normalize_vec({last_mag[0], last_mag[1], last_mag[2]});
 
-    // SINGULARITY GUARD: Prevents the 3D matrix from collapsing into NaN
-    // if Gravity and Magnetic North become mathematically parallel.
+    // E is East (Always perfectly horizontal to Gravity)
     Vec3 E = cross_product(M, A);
     float len_E = sqrt(E.x*E.x + E.y*E.y + E.z*E.z);
     if (len_E > 0.001f) {
         E.x /= len_E; E.y /= len_E; E.z /= len_E;
-        last_E = E; 
     } else {
-        E = last_E; 
+        E = last_E; // Singularity guard if perfectly parallel
     }
-    
-    Vec3 N = normalize_vec(cross_product(A, E));
-
-    Quat current_q = matrix_to_quat(E, N, A);
 
     if (last_timestamp == 0) {
-        last_timestamp = timestamp;
-        last_q = current_q;
+        last_A = A; last_E = E; last_timestamp = timestamp;
         return;
     }
 
@@ -103,35 +67,36 @@ void compute_sensor_fusion(int64_t timestamp) {
         return;
     }
 
-    // Shortest path alignment
-    float dot = current_q.w*last_q.w + current_q.x*last_q.x + current_q.y*last_q.y + current_q.z*last_q.z;
-    if (dot < 0.0f) {
-        current_q.w = -current_q.w; current_q.x = -current_q.x; 
-        current_q.y = -current_q.y; current_q.z = -current_q.z;
-    }
+    // ---------------------------------------------------------
+    // FPS DECOUPLED KINEMATICS (The 90-Degree Fix)
+    // ---------------------------------------------------------
 
-    Quat inv_last = { last_q.w, -last_q.x, -last_q.y, -last_q.z };
+    // 1. LOCAL PITCH (X-Axis) 
+    // Extracted by measuring the rotation of Gravity exclusively in the device's Y-Z plane.
+    float pitch_sin = last_A.y * A.z - last_A.z * A.y;
+    if (pitch_sin > 1.0f) pitch_sin = 1.0f;
+    if (pitch_sin < -1.0f) pitch_sin = -1.0f;
+    // Negated to match Android's Right-Hand Coordinate Rule
+    float raw_pitch = -asin(pitch_sin) / dt;
 
-    // THE FIX: True Local Frame Delta (inv_last * current_q)
-    // This physically anchors the rotation output to the device's casing instead of the Earth,
-    // permanently curing the racing-game tilt issue at 90 degrees.
-    Quat dq = {
-        inv_last.w*current_q.w - inv_last.x*current_q.x - inv_last.y*current_q.y - inv_last.z*current_q.z,
-        inv_last.w*current_q.x + inv_last.x*current_q.w + inv_last.y*current_q.z - inv_last.z*current_q.y,
-        inv_last.w*current_q.y - inv_last.x*current_q.z + inv_last.y*current_q.w + inv_last.z*current_q.x,
-        inv_last.w*current_q.z + inv_last.x*current_q.y - inv_last.y*current_q.x + inv_last.z*current_q.w
-    };
+    // 2. GLOBAL YAW (Y-Axis)
+    // Extracted by measuring horizontal turning around the Global World Up axis (Gravity)[span_16](start_span)[span_16](end_span).
+    // By dotting the cross-product of East with Gravity, we get pure yaw regardless of pitch angle.
+    Vec3 E_cross = cross_product(last_E, E);
+    float yaw_sin = dot_product(E_cross, A);
+    if (yaw_sin > 1.0f) yaw_sin = 1.0f;
+    if (yaw_sin < -1.0f) yaw_sin = -1.0f;
+    // Negated to match Android's Right-Hand Coordinate Rule
+    float raw_yaw = -asin(yaw_sin) / dt;
 
-    // Extract angular velocity
-    float raw_x = -(2.0f * dq.x) / dt;
-    float raw_y = -(2.0f * dq.y) / dt;
-    float raw_z = -(2.0f * dq.z) / dt;
+    // 3. ISOLATED FPS MAPPING
+    // Bypasses the 3D quaternion global/local collapse entirely[span_17](start_span)[span_17](end_span)[span_18](start_span)[span_18](end_span).
+    final_gyro.x = (fabs(raw_pitch) > MAG_NOISE_GATE) ? raw_pitch * SENSITIVITY : 0.0f;
+    final_gyro.y = (fabs(raw_yaw) > MAG_NOISE_GATE) ? raw_yaw * SENSITIVITY : 0.0f;
+    final_gyro.z = 0.0f; // Locked to zero to permanently kill the racing-game tilt
 
-    final_gyro.x = (fabs(raw_x) > MAG_NOISE_GATE) ? raw_x * SENSITIVITY : 0.0f;
-    final_gyro.y = (fabs(raw_y) > MAG_NOISE_GATE) ? raw_y * SENSITIVITY : 0.0f;
-    final_gyro.z = (fabs(raw_z) > MAG_NOISE_GATE) ? raw_z * SENSITIVITY : 0.0f;
-
-    last_q = current_q;
+    last_A = A;
+    last_E = E;
     last_timestamp = timestamp;
 }
 
@@ -150,7 +115,7 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                 fusion_needed = true;
             } 
             else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || events[i].type == 14) {
-                // Instantly center the vector sphere using exact hardware bias[span_2](start_span)[span_2](end_span)
+                // Instantly center the vector sphere using exact CPU X hardware bias[span_19](start_span)[span_19](end_span)
                 last_mag[0] = events[i].uncalibrated_magnetic.x_uncalib - HARD_IRON_X;
                 last_mag[1] = events[i].uncalibrated_magnetic.y_uncalib - HARD_IRON_Y;
                 last_mag[2] = events[i].uncalibrated_magnetic.z_uncalib - HARD_IRON_Z;
@@ -171,7 +136,6 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
             }
         }
 
-        // Synchronous 200Hz Loop Execution
         if (fusion_needed && latest_ts > 0) {
             compute_sensor_fusion(latest_ts);
         }
