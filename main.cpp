@@ -6,124 +6,121 @@
 #include "zygisk.hpp"
 
 // --- TUNABLE PARAMETERS ---
-// Proportional gain: Controls how aggressively the quaternion tracks your hands.
-// Higher = faster response (lower delay). Lower = smoother macro movements.
-// Recommended gaming range: 8.0f - 16.0f
-static const float MAHONY_KP = 10.0f; 
-
-// Master Sensitivity multiplier (1.0f = pure 1:1 hardware translation)
+static const float MAG_NOISE_GATE = 0.005f; 
 static const float SENSITIVITY = 1.0f;
 
-// Kills resting hardware sensor noise floor
-static const float NOISE_FLOOR = 0.003f;
+struct Vec3 { float x, y, z; };
+struct Quat { float w, x, y, z; };
 
-// --- STATE VARIABLES ---
-// Quaternion orientation state (w, x, y, z) initialized to identity
-static float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
+Vec3 cross_product(Vec3 a, Vec3 b) {
+    return { a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x };
+}
+Vec3 normalize_vec(Vec3 v) {
+    float len = sqrt(v.x*v.x + v.y*v.y + v.z*v.z);
+    if (len < 0.0001f) return {0.0f, 0.0f, 0.0f};
+    return { v.x/len, v.y/len, v.z/len };
+}
 
+Quat matrix_to_quat(Vec3 E, Vec3 N, Vec3 A) {
+    Quat q;
+    float trace = E.x + N.y + A.z;
+    if (trace > 0.0f) {
+        float s = sqrt(trace + 1.0f) * 2.0f;
+        q.w = 0.25f * s;
+        q.x = (N.z - A.y) / s;
+        q.y = (A.x - E.z) / s;
+        q.z = (E.y - N.x) / s;
+    } else if ((E.x > N.y) && (E.x > A.z)) {
+        float s = sqrt(1.0f + E.x - N.y - A.z) * 2.0f;
+        q.w = (N.z - A.y) / s;
+        q.x = 0.25f * s;
+        q.y = (N.x + E.y) / s;
+        q.z = (A.x + E.z) / s;
+    } else if (N.y > A.z) {
+        float s = sqrt(1.0f + N.y - E.x - A.z) * 2.0f;
+        q.w = (A.x - E.z) / s;
+        q.x = (N.x + E.y) / s;
+        q.y = 0.25f * s;
+        q.z = (A.y + N.z) / s;
+    } else {
+        float s = sqrt(1.0f + A.z - E.x - N.y) * 2.0f;
+        q.w = (E.y - N.x) / s;
+        q.x = (A.x + E.z) / s;
+        q.y = (A.y + N.z) / s;
+        q.z = 0.25f * s;
+    }
+    float len = sqrt(q.w*q.w + q.x*q.x + q.y*q.y + q.z*q.z);
+    return { q.w/len, q.x/len, q.y/len, q.z/len };
+}
+
+// Memory States
 static float last_accel[3] = {0.0f, 0.0f, 9.81f};
-static float last_mag[3]   = {0.0f, 1.0f, 0.0f};
+static float last_mag[3] = {0.0f, 1.0f, 0.0f};
 static int64_t last_timestamp = 0;
 
-static float final_gyro[3] = {0.0f, 0.0f, 0.0f};
+static Quat last_q = {1.0f, 0.0f, 0.0f, 0.0f};
+static Vec3 final_gyro = {0.0f, 0.0f, 0.0f};
+
+// STATIC BIAS ANCHOR
+static bool bias_locked = false;
+static float locked_bias[3] = {0.0f, 0.0f, 0.0f};
 
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
 static getEvents_t orig_getEvents = nullptr;
-
 typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
 static setEventRate_t orig_setEventRate = nullptr;
 
-// Clean, NEON-optimized inverse square root
-inline float inv_sqrt(float x) {
-    return 1.0f / sqrtf(x);
-}
-
-// Pure Quaternion Mahony AHRS Algorithm (Gyro-less Architecture)
-void mahony_update(float ax, float ay, float az, float mx, float my, float mz, float dt) {
-    // 1. Vector Normalization
-    float norm_a = inv_sqrt(ax * ax + ay * ay + az * az);
-    if (isnan(norm_a) || isinf(norm_a)) return;
-    ax *= norm_a; ay *= norm_a; az *= norm_a;
-
-    float norm_m = inv_sqrt(mx * mx + my * my + mz * mz);
-    if (isnan(norm_m) || isinf(norm_m)) return;
-    mx *= norm_m; my *= norm_m; mz *= norm_m;
-
-    // Auxiliary variables to minimize arithmetic ops per frame
-    float q0q0 = q0 * q0;
-    float q0q1 = q0 * q1;
-    float q0q2 = q0 * q2;
-    float q0q3 = q0 * q3;
-    float q1q1 = q1 * q1;
-    float q1q2 = q1 * q2;
-    float q1q3 = q1 * q3;
-    float q2q2 = q2 * q2;
-    float q2q3 = q2 * q3;
-    float q3q3 = q3 * q3;
-
-    // 2. Continuous 3D Tilt-Compensation
-    // Rotate measured magnetic vector into the Earth coordinate frame (h)
-    float hx = 2.0f * (mx * (0.5f - q2q2 - q3q3) + my * (q1q2 - q0q3) + mz * (q1q3 + q0q2));
-    float hy = 2.0f * (mx * (q1q2 + q0q3) + my * (0.5f - q1q1 - q3q3) + mz * (q2q3 - q0q1));
-    float bx = sqrtf(hx * hx + hy * hy);
-    float bz = 2.0f * (mx * (q1q3 - q0q2) + my * (q2q3 + q0q1) + mz * (0.5f - q1q1 - q2q2));
-
-    // 3. Estimated Gravity (v) and Magnetic Field (w) half-vectors in device body frame
-    float halfvx = q1q3 - q0q2;
-    float halfvy = q0q1 + q2q3;
-    float halfvz = q0q0 - 0.5f + q3q3;
-
-    float halfwx = bx * (0.5f - q2q2 - q3q3) + bz * (q1q3 - q0q2);
-    float halfwy = bx * (q1q2 - q0q3) + bz * (q0q1 + q2q3);
-    float halfwz = bx * (q0q2 + q1q3) + bz * (0.5f - q1q1 - q2q2);
-
-    // 4. Calculate 3D Cross-Product Error Torque: e = (a x v) + (m x w)
-    float halfex = (ay * halfvz - az * halfvy) + (my * halfwz - mz * halfwy);
-    float halfey = (az * halfvx - ax * halfvz) + (mz * halfwx - mx * halfwz);
-    float halfez = (ax * halfvy - ay * halfvx) + (mx * halfwy - my * halfwx);
-
-    // 5. Angular Velocity Feedback Vector (rad/s)
-    // Scale the raw half-error torque by proportional gain
-    float wx = 2.0f * MAHONY_KP * halfex;
-    float wy = 2.0f * MAHONY_KP * halfey;
-    float wz = 2.0f * MAHONY_KP * halfez;
-
-    // 6. Integrate Quaternion Rate: q_dot = 0.5 * q * omega
-    float qa = q0, qb = q1, qc = q2;
-    q0 += (-qb * wx - qc * wy - q3 * wz) * (0.5f * dt);
-    q1 += ( qa * wx + qc * wz - q3 * wy) * (0.5f * dt);
-    q2 += ( qa * wy - qb * wz + q3 * wx) * (0.5f * dt);
-    q3 += ( qa * wz + qb * wy - qc * wx) * (0.5f * dt);
-
-    // Normalize final quaternion
-    float norm_q = inv_sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
-    q0 *= norm_q; q1 *= norm_q; q2 *= norm_q; q3 *= norm_q;
-
-    // 7. Inject Direct Angular Velocity into Game Payload
-    final_gyro[0] = (fabsf(wx) > NOISE_FLOOR) ? wx * SENSITIVITY : 0.0f;
-    final_gyro[1] = (fabsf(wy) > NOISE_FLOOR) ? wy * SENSITIVITY : 0.0f;
-    final_gyro[2] = (fabsf(wz) > NOISE_FLOOR) ? wz * SENSITIVITY : 0.0f;
-}
-
 void compute_sensor_fusion(int64_t timestamp) {
+    Vec3 A = normalize_vec({last_accel[0], last_accel[1], last_accel[2]});
+    Vec3 M = normalize_vec({last_mag[0], last_mag[1], last_mag[2]});
+
+    // 1. Orthogonal Basis
+    Vec3 E = normalize_vec(cross_product(M, A));
+    Vec3 N = normalize_vec(cross_product(A, E));
+
+    // 2. Direct Trace-Check Matrix to Quaternion
+    Quat current_q = matrix_to_quat(E, N, A);
+
     if (last_timestamp == 0) {
         last_timestamp = timestamp;
+        last_q = current_q;
         return;
     }
 
     float dt = (timestamp - last_timestamp) / 1000000000.0f;
-    // Guard against timestamp batch anomalies and divide-by-zero spikes
     if (dt <= 0.001f || dt > 0.1f) {
         last_timestamp = timestamp;
         return;
     }
 
-    mahony_update(
-        last_accel[0], last_accel[1], last_accel[2],
-        last_mag[0],   last_mag[1],   last_mag[2],
-        dt
-    );
+    // Shortest path check to prevent inversion snapping
+    float dot = current_q.w*last_q.w + current_q.x*last_q.x + current_q.y*last_q.y + current_q.z*last_q.z;
+    if (dot < 0.0f) {
+        current_q.w = -current_q.w; current_q.x = -current_q.x; 
+        current_q.y = -current_q.y; current_q.z = -current_q.z;
+    }
 
+    // 3. Quaternion Conjugate for previous frame inverse
+    Quat inv_last = { last_q.w, -last_q.x, -last_q.y, -last_q.z };
+
+    // 4. Delta Q = Current * Inverse(Previous)
+    Quat dq = {
+        current_q.w*inv_last.w - current_q.x*inv_last.x - current_q.y*inv_last.y - current_q.z*inv_last.z,
+        current_q.w*inv_last.x + current_q.x*inv_last.w + current_q.y*inv_last.z - current_q.z*inv_last.y,
+        current_q.w*inv_last.y - current_q.x*inv_last.z + current_q.y*inv_last.w + current_q.z*inv_last.x,
+        current_q.w*inv_last.z + current_q.x*inv_last.y - current_q.y*inv_last.x + current_q.z*inv_last.w
+    };
+
+    // 5. Extract raw angular velocity directly from quaternion vector components
+    float raw_x = (2.0f * dq.x) / dt;
+    float raw_y = (2.0f * dq.y) / dt;
+    float raw_z = (2.0f * dq.z) / dt;
+
+    final_gyro.x = (fabs(raw_x) > MAG_NOISE_GATE) ? raw_x * SENSITIVITY : 0.0f;
+    final_gyro.y = (fabs(raw_y) > MAG_NOISE_GATE) ? raw_y * SENSITIVITY : 0.0f;
+    final_gyro.z = (fabs(raw_z) > MAG_NOISE_GATE) ? raw_z * SENSITIVITY : 0.0f;
+
+    last_q = current_q;
     last_timestamp = timestamp;
 }
 
@@ -141,27 +138,35 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                 if (events[i].timestamp > latest_ts) latest_ts = events[i].timestamp;
                 fusion_needed = true;
             } 
-            // Intercept Uncalibrated Magnetometer (Type 14) to bypass OS hard-iron drift
             else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || events[i].type == 14) {
-                last_mag[0] = events[i].uncalibrated_magnetic.x_uncalib;
-                last_mag[1] = events[i].uncalibrated_magnetic.y_uncalib;
-                last_mag[2] = events[i].uncalibrated_magnetic.z_uncalib;
+                // THE FIX: Capture the OS hard-iron bias exactly once and lock it permanently
+                if (!bias_locked && (events[i].uncalibrated_magnetic.x_bias != 0.0f || events[i].uncalibrated_magnetic.y_bias != 0.0f)) {
+                    locked_bias[0] = events[i].uncalibrated_magnetic.x_bias;
+                    locked_bias[1] = events[i].uncalibrated_magnetic.y_bias;
+                    locked_bias[2] = events[i].uncalibrated_magnetic.z_bias;
+                    bias_locked = true;
+                }
+                
+                // Subtract the locked bias to perfectly center the sphere without allowing mid-game OS drift
+                last_mag[0] = events[i].uncalibrated_magnetic.x_uncalib - locked_bias[0];
+                last_mag[1] = events[i].uncalibrated_magnetic.y_uncalib - locked_bias[1];
+                last_mag[2] = events[i].uncalibrated_magnetic.z_uncalib - locked_bias[2];
+                
                 if (events[i].timestamp > latest_ts) latest_ts = events[i].timestamp;
                 fusion_needed = true;
             } 
-            // Fallback for drivers that route Type 2 only
             else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD) {
+                // Fallback: If device doesn't support Type 14, just use standard Mag
                 last_mag[0] = events[i].magnetic.v[0];
                 last_mag[1] = events[i].magnetic.v[1];
                 last_mag[2] = events[i].magnetic.v[2];
                 if (events[i].timestamp > latest_ts) latest_ts = events[i].timestamp;
                 fusion_needed = true;
             } 
-            // Trojan horse delivery: Overwrite stock virtual gyro payload
             else if (events[i].type == ASENSOR_TYPE_GYROSCOPE) {
-                events[i].vector.x = final_gyro[0]; 
-                events[i].vector.y = final_gyro[1]; 
-                events[i].vector.z = final_gyro[2]; 
+                events[i].vector.x = final_gyro.x; 
+                events[i].vector.y = final_gyro.y; 
+                events[i].vector.z = final_gyro.z; 
             }
         }
 
@@ -180,13 +185,10 @@ void install_hook() {
     void* libandroid = dlopen("libandroid.so", RTLD_NOW);
     if (libandroid) {
         void* target_get = dlsym(libandroid, "ASensorEventQueue_getEvents");
-        if (target_get) {
-            DobbyHook(target_get, (dobby_dummy_func_t)hook_ASensorEventQueue_getEvents, (dobby_dummy_func_t*)&orig_getEvents);
-        }
+        if (target_get) DobbyHook(target_get, (dobby_dummy_func_t)hook_ASensorEventQueue_getEvents, (dobby_dummy_func_t*)&orig_getEvents);
+        
         void* target_rate = dlsym(libandroid, "ASensorEventQueue_setEventRate");
-        if (target_rate) {
-            DobbyHook(target_rate, (dobby_dummy_func_t)hook_ASensorEventQueue_setEventRate, (dobby_dummy_func_t*)&orig_setEventRate);
-        }
+        if (target_rate) DobbyHook(target_rate, (dobby_dummy_func_t)hook_ASensorEventQueue_setEventRate, (dobby_dummy_func_t*)&orig_setEventRate);
     }
 }
 
