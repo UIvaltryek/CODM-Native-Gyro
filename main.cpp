@@ -63,7 +63,7 @@ static float last_accel[3] = {0.0f, 0.0f, 9.81f};
 static float last_mag[3] = {0.0f, 1.0f, 0.0f};
 static int64_t last_timestamp = 0;
 
-static Vec3 last_E = {1.0f, 0.0f, 0.0f}; // Fallback vector
+static Vec3 last_E = {1.0f, 0.0f, 0.0f}; // Fallback vector for 90-degree parallel singularities
 static Quat last_q = {1.0f, 0.0f, 0.0f, 0.0f};
 static Vec3 final_gyro = {0.0f, 0.0f, 0.0f};
 
@@ -76,14 +76,15 @@ void compute_sensor_fusion(int64_t timestamp) {
     Vec3 A = normalize_vec({last_accel[0], last_accel[1], last_accel[2]});
     Vec3 M = normalize_vec({last_mag[0], last_mag[1], last_mag[2]});
 
-    // SINGULARITY GUARD: Prevent cross-product collapse at 90 degrees
+    // SINGULARITY GUARD: Prevents the 3D matrix from collapsing into NaN
+    // if Gravity and Magnetic North become mathematically parallel.
     Vec3 E = cross_product(M, A);
     float len_E = sqrt(E.x*E.x + E.y*E.y + E.z*E.z);
     if (len_E > 0.001f) {
         E.x /= len_E; E.y /= len_E; E.z /= len_E;
-        last_E = E; // Save a healthy East vector
+        last_E = E; 
     } else {
-        E = last_E; // Inject fallback if Gravity and North become perfectly parallel
+        E = last_E; 
     }
     
     Vec3 N = normalize_vec(cross_product(A, E));
@@ -111,15 +112,17 @@ void compute_sensor_fusion(int64_t timestamp) {
 
     Quat inv_last = { last_q.w, -last_q.x, -last_q.y, -last_q.z };
 
-    // LOCAL FRAME DELTA: Forces angular velocity onto the physical device casing
+    // THE FIX: True Local Frame Delta (inv_last * current_q)
+    // This physically anchors the rotation output to the device's casing instead of the Earth,
+    // permanently curing the racing-game tilt issue at 90 degrees.
     Quat dq = {
-        current_q.w*inv_last.w - current_q.x*inv_last.x - current_q.y*inv_last.y - current_q.z*inv_last.z,
-        current_q.w*inv_last.x + current_q.x*inv_last.w + current_q.y*inv_last.z - current_q.z*inv_last.y,
-        current_q.w*inv_last.y - current_q.x*inv_last.z + current_q.y*inv_last.w + current_q.z*inv_last.x,
-        current_q.w*inv_last.z + current_q.x*inv_last.y - current_q.y*inv_last.x + current_q.z*inv_last.w
+        inv_last.w*current_q.w - inv_last.x*current_q.x - inv_last.y*current_q.y - inv_last.z*current_q.z,
+        inv_last.w*current_q.x + inv_last.x*current_q.w + inv_last.y*current_q.z - inv_last.z*current_q.y,
+        inv_last.w*current_q.y - inv_last.x*current_q.z + inv_last.y*current_q.w + inv_last.z*current_q.x,
+        inv_last.w*current_q.z + inv_last.x*current_q.y - inv_last.y*current_q.x + inv_last.z*current_q.w
     };
 
-    // Extract velocity. Negated to match Android's Right-Hand Coordinate Rule.
+    // Extract angular velocity
     float raw_x = -(2.0f * dq.x) / dt;
     float raw_y = -(2.0f * dq.y) / dt;
     float raw_z = -(2.0f * dq.z) / dt;
@@ -147,7 +150,7 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                 fusion_needed = true;
             } 
             else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || events[i].type == 14) {
-                // Instantly center the sphere using exact hardware bias[span_2](start_span)[span_2](end_span)
+                // Instantly center the vector sphere using exact hardware bias[span_2](start_span)[span_2](end_span)
                 last_mag[0] = events[i].uncalibrated_magnetic.x_uncalib - HARD_IRON_X;
                 last_mag[1] = events[i].uncalibrated_magnetic.y_uncalib - HARD_IRON_Y;
                 last_mag[2] = events[i].uncalibrated_magnetic.z_uncalib - HARD_IRON_Z;
