@@ -61,7 +61,7 @@ static int64_t last_timestamp = 0;
 static Quat last_q = {1.0f, 0.0f, 0.0f, 0.0f};
 static Vec3 final_gyro = {0.0f, 0.0f, 0.0f};
 
-// STATIC BIAS ANCHOR
+// Static Bias Lock
 static bool bias_locked = false;
 static float locked_bias[3] = {0.0f, 0.0f, 0.0f};
 
@@ -74,11 +74,10 @@ void compute_sensor_fusion(int64_t timestamp) {
     Vec3 A = normalize_vec({last_accel[0], last_accel[1], last_accel[2]});
     Vec3 M = normalize_vec({last_mag[0], last_mag[1], last_mag[2]});
 
-    // 1. Orthogonal Basis
+    // Orthogonal Basis
     Vec3 E = normalize_vec(cross_product(M, A));
     Vec3 N = normalize_vec(cross_product(A, E));
 
-    // 2. Direct Trace-Check Matrix to Quaternion
     Quat current_q = matrix_to_quat(E, N, A);
 
     if (last_timestamp == 0) {
@@ -93,29 +92,30 @@ void compute_sensor_fusion(int64_t timestamp) {
         return;
     }
 
-    // Shortest path check to prevent inversion snapping
+    // Shortest path alignment
     float dot = current_q.w*last_q.w + current_q.x*last_q.x + current_q.y*last_q.y + current_q.z*last_q.z;
     if (dot < 0.0f) {
         current_q.w = -current_q.w; current_q.x = -current_q.x; 
         current_q.y = -current_q.y; current_q.z = -current_q.z;
     }
 
-    // 3. Quaternion Conjugate for previous frame inverse
+    // Inverse of previous frame
     Quat inv_last = { last_q.w, -last_q.x, -last_q.y, -last_q.z };
 
-    // 4. Delta Q = Current * Inverse(Previous)
+    // THE FIX: Local Frame Delta = inv_last * current_q
     Quat dq = {
-        current_q.w*inv_last.w - current_q.x*inv_last.x - current_q.y*inv_last.y - current_q.z*inv_last.z,
-        current_q.w*inv_last.x + current_q.x*inv_last.w + current_q.y*inv_last.z - current_q.z*inv_last.y,
-        current_q.w*inv_last.y - current_q.x*inv_last.z + current_q.y*inv_last.w + current_q.z*inv_last.x,
-        current_q.w*inv_last.z + current_q.x*inv_last.y - current_q.y*inv_last.x + current_q.z*inv_last.w
+        inv_last.w*current_q.w - inv_last.x*current_q.x - inv_last.y*current_q.y - inv_last.z*current_q.z,
+        inv_last.w*current_q.x + inv_last.x*current_q.w + inv_last.y*current_q.z - inv_last.z*current_q.y,
+        inv_last.w*current_q.y - inv_last.x*current_q.z + inv_last.y*current_q.w + inv_last.z*current_q.x,
+        inv_last.w*current_q.z + inv_last.x*current_q.y - inv_last.y*current_q.x + inv_last.z*current_q.w
     };
 
-    // 5. Extract raw angular velocity directly from quaternion vector components
-    float raw_x = (2.0f * dq.x) / dt;
-    float raw_y = (2.0f * dq.y) / dt;
-    float raw_z = (2.0f * dq.z) / dt;
+    // Extract velocity. Negated to match Android's right-hand coordinate system.
+    float raw_x = -(2.0f * dq.x) / dt;
+    float raw_y = -(2.0f * dq.y) / dt;
+    float raw_z = -(2.0f * dq.z) / dt;
 
+    // Direct output (no EMA filters)
     final_gyro.x = (fabs(raw_x) > MAG_NOISE_GATE) ? raw_x * SENSITIVITY : 0.0f;
     final_gyro.y = (fabs(raw_y) > MAG_NOISE_GATE) ? raw_y * SENSITIVITY : 0.0f;
     final_gyro.z = (fabs(raw_z) > MAG_NOISE_GATE) ? raw_z * SENSITIVITY : 0.0f;
@@ -139,7 +139,7 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                 fusion_needed = true;
             } 
             else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || events[i].type == 14) {
-                // THE FIX: Capture the OS hard-iron bias exactly once and lock it permanently
+                // Lock hard-iron OS bias permanently to prevent mid-game warping
                 if (!bias_locked && (events[i].uncalibrated_magnetic.x_bias != 0.0f || events[i].uncalibrated_magnetic.y_bias != 0.0f)) {
                     locked_bias[0] = events[i].uncalibrated_magnetic.x_bias;
                     locked_bias[1] = events[i].uncalibrated_magnetic.y_bias;
@@ -147,7 +147,7 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                     bias_locked = true;
                 }
                 
-                // Subtract the locked bias to perfectly center the sphere without allowing mid-game OS drift
+                // Subtract bias to perfectly center the vector sphere
                 last_mag[0] = events[i].uncalibrated_magnetic.x_uncalib - locked_bias[0];
                 last_mag[1] = events[i].uncalibrated_magnetic.y_uncalib - locked_bias[1];
                 last_mag[2] = events[i].uncalibrated_magnetic.z_uncalib - locked_bias[2];
@@ -156,7 +156,6 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                 fusion_needed = true;
             } 
             else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD) {
-                // Fallback: If device doesn't support Type 14, just use standard Mag
                 last_mag[0] = events[i].magnetic.v[0];
                 last_mag[1] = events[i].magnetic.v[1];
                 last_mag[2] = events[i].magnetic.v[2];
@@ -186,7 +185,6 @@ void install_hook() {
     if (libandroid) {
         void* target_get = dlsym(libandroid, "ASensorEventQueue_getEvents");
         if (target_get) DobbyHook(target_get, (dobby_dummy_func_t)hook_ASensorEventQueue_getEvents, (dobby_dummy_func_t*)&orig_getEvents);
-        
         void* target_rate = dlsym(libandroid, "ASensorEventQueue_setEventRate");
         if (target_rate) DobbyHook(target_rate, (dobby_dummy_func_t)hook_ASensorEventQueue_setEventRate, (dobby_dummy_func_t*)&orig_setEventRate);
     }
