@@ -5,95 +5,187 @@
 #include "dobby.h"
 #include "zygisk.hpp"
 
-// --- MIDDLEMAN TUNABLE PARAMETERS ---
-
-// 1. The Deadzone Spring
-static const float NOISE_GATE = 0.005f;      // Ignore autonomous wobbling below this rad/s
-static const float BOOST_OFFSET = 0.13999f;  // Your exact pre-tensioning offset
-static const float FADE_THRESHOLD = 0.5f;    // Speed (rad/s) where the boost completely fades to 0.0 to preserve fast flicks
-
-// 2. The Inverse Filter (Lead Compensator)
-// Represents the time-constant (in seconds) of MediaTek's lag. 
-// A value of 0.05f looks 50 milliseconds into the future to cancel the phase lag.
-// Increase to 0.10f if the ending "ice-slide" lag is still too long.
-static const float SHARPNESS = 0.05f; 
+// --- HARDWARE CALIBRATION ---
+// Your exact MT6835 Hard-Iron Biases
+static const float HARD_IRON_X = 93.76f;
+static const float HARD_IRON_Y = -29.09f;
+static const float HARD_IRON_Z = 967.01f;
 
 // --- STATE TRACKERS ---
-static float last_x = 0.0f;
-static float last_y = 0.0f;
-static float last_z = 0.0f;
-static int64_t last_ts = 0;
+static float accel_data[3] = {0.0f, 0.0f, 9.81f};
+static float mag_data[3] = {0.0f, 1.0f, 0.0f};
+
+// Quaternion state: [W, X, Y, Z]
+static float prev_q[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+static float final_gyro[3] = {0.0f, 0.0f, 0.0f};
+
+static int64_t prev_ts = 0;
+static bool is_initialized = false;
 
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
 static getEvents_t orig_getEvents = nullptr;
 typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
 static setEventRate_t orig_setEventRate = nullptr;
 
-float process_axis(float current_val, float &last_val, float dt) {
-    // 1. DECONVOLUTION (Kill Start/End Lag)
-    // Calculate exact acceleration (Derivative)
-    float derivative = (current_val - last_val) / dt;
-    
-    // Add the predictive lead to cancel MediaTek's low-pass buffer
-    float sharpened = current_val + (SHARPNESS * derivative);
-    last_val = current_val;
+// AOSP Rotation Matrix Generation
+bool calculateRotationMatrix(float R[9], float A[3], float E[3]) {
+    float normA = sqrt(A[0]*A[0] + A[1]*A[1] + A[2]*A[2]);
+    if (normA < 0.1f) return false;
+    float ax = A[0]/normA, ay = A[1]/normA, az = A[2]/normA;
 
-    // 2. THE DIGITAL BRAKE & NOISE GATE
-    if (fabs(sharpened) < NOISE_GATE) {
-        return 0.0f; 
+    // Cross Product: Mag x Accel = "East" vector
+    float Hx = E[1]*az - E[2]*ay;
+    float Hy = E[2]*ax - E[0]*az;
+    float Hz = E[0]*ay - E[1]*ax;
+    float normH = sqrt(Hx*Hx + Hy*Hy + Hz*Hz);
+    if (normH < 0.1f) return false;
+    Hx /= normH; Hy /= normH; Hz /= normH;
+
+    // Cross Product: Accel x East = "North" vector
+    float Mx = ay*Hz - az*Hy;
+    float My = az*Hx - ax*Hz;
+    float Mz = ax*Hy - ay*Hx;
+
+    R[0] = Hx; R[1] = Hy; R[2] = Hz;
+    R[3] = Mx; R[4] = My; R[5] = Mz;
+    R[6] = ax; R[7] = ay; R[8] = az;
+    return true;
+}
+
+// Convert Rotation Matrix strictly to Quaternion [W, X, Y, Z]
+void matrixToQuaternion(float R[9], float q[4]) {
+    float trace = R[0] + R[4] + R[8];
+    if (trace > 0.0f) {
+        float s = sqrt(trace + 1.0f) * 2.0f;
+        q[0] = 0.25f * s; // W
+        q[1] = (R[7] - R[5]) / s; // X
+        q[2] = (R[2] - R[6]) / s; // Y
+        q[3] = (R[3] - R[1]) / s; // Z
+    } else if ((R[0] > R[4]) && (R[0] > R[8])) {
+        float s = sqrt(1.0f + R[0] - R[4] - R[8]) * 2.0f;
+        q[0] = (R[7] - R[5]) / s; // W
+        q[1] = 0.25f * s; // X
+        q[2] = (R[3] + R[1]) / s; // Y
+        q[3] = (R[2] + R[6]) / s; // Z
+    } else if (R[4] > R[8]) {
+        float s = sqrt(1.0f + R[4] - R[0] - R[8]) * 2.0f;
+        q[0] = (R[2] - R[6]) / s; // W
+        q[1] = (R[3] + R[1]) / s; // X
+        q[2] = 0.25f * s; // Y
+        q[3] = (R[7] + R[5]) / s; // Z
+    } else {
+        float s = sqrt(1.0f + R[8] - R[0] - R[4]) * 2.0f;
+        q[0] = (R[3] - R[1]) / s; // W
+        q[1] = (R[2] + R[6]) / s; // X
+        q[2] = (R[7] + R[5]) / s; // Y
+        q[3] = 0.25f * s; // Z
+    }
+}
+
+// The Core Kinematic Engine
+void compute_pure_kinematics(int64_t timestamp) {
+    float R[9];
+    float curr_q[4];
+
+    if (!calculateRotationMatrix(R, accel_data, mag_data)) return;
+    matrixToQuaternion(R, curr_q);
+
+    if (!is_initialized) {
+        prev_q[0] = curr_q[0]; prev_q[1] = curr_q[1];
+        prev_q[2] = curr_q[2]; prev_q[3] = curr_q[3];
+        prev_ts = timestamp;
+        is_initialized = true;
+        return;
     }
 
-    // 3. DEADZONE SPRING (with Linear Fade)
-    float sign = (sharpened > 0.0f) ? 1.0f : -1.0f;
-    
-    // Calculate how much boost to apply.
-    // At 0.005 rad/s, it applies nearly 100% of 0.13999.
-    // At >= 0.5 rad/s, the boost drops to exactly 0.0, leaving your fast flicks perfectly natural.
-    float fade_factor = fmax(0.0f, 1.0f - (fabs(sharpened) / FADE_THRESHOLD));
-    float dynamic_boost = BOOST_OFFSET * fade_factor;
+    float dt = (timestamp - prev_ts) / 1000000000.0f;
+    if (dt <= 0.0f || dt > 0.2f) dt = 0.016f; // Fallback to 60hz frame time
 
-    // Output the lag-free signal + the deadzone spring
-    return sharpened + (sign * dynamic_boost);
+    // Quaternion Double Cover Check (Prevents random 180-degree snapping)
+    float dot_product = (prev_q[0] * curr_q[0]) + (prev_q[1] * curr_q[1]) + 
+                        (prev_q[2] * curr_q[2]) + (prev_q[3] * curr_q[3]);
+    if (dot_product < 0.0f) {
+        curr_q[0] = -curr_q[0]; curr_q[1] = -curr_q[1];
+        curr_q[2] = -curr_q[2]; curr_q[3] = -curr_q[3];
+    }
+
+    // Calculate Delta Quaternion: q_delta = prev_q^-1 * curr_q
+    // prev_q^-1 is simply [W, -X, -Y, -Z]
+    float dw = prev_q[0]*curr_q[0] - (-prev_q[1])*curr_q[1] - (-prev_q[2])*curr_q[2] - (-prev_q[3])*curr_q[3];
+    float dx = prev_q[0]*curr_q[1] + (-prev_q[1])*curr_q[0] + (-prev_q[2])*curr_q[3] - (-prev_q[3])*curr_q[2];
+    float dy = prev_q[0]*curr_q[2] - (-prev_q[1])*curr_q[3] + (-prev_q[2])*curr_q[0] + (-prev_q[3])*curr_q[1];
+    float dz = prev_q[0]*curr_q[3] + (-prev_q[1])*curr_q[2] - (-prev_q[2])*curr_q[1] + (-prev_q[3])*curr_q[0];
+
+    // Extract Pure Angular Velocity (rad/s)
+    // Formula: omega = 2 * (q_delta_vector) / dt
+    final_gyro[0] = (2.0f * dx) / dt;
+    final_gyro[1] = (2.0f * dy) / dt;
+    final_gyro[2] = (2.0f * dz) / dt;
+
+    // Save state for the next frame
+    prev_q[0] = curr_q[0]; prev_q[1] = curr_q[1];
+    prev_q[2] = curr_q[2]; prev_q[3] = curr_q[3];
+    prev_ts = timestamp;
 }
 
 ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent* events, size_t count) {
     ssize_t actual_events = orig_getEvents(queue, events, count);
     if (actual_events > 0) {
+        bool fusion_ready = false;
+        int64_t latest_ts = 0;
+
         for (ssize_t i = 0; i < actual_events; i++) {
             
-            // Intercept standard Gyroscope (Type 4) and Uncalibrated Gyroscope (Type 16)
-            if (events[i].type == ASENSOR_TYPE_GYROSCOPE || events[i].type == 16) {
-                
-                int64_t current_ts = events[i].timestamp;
-                if (last_ts == 0) {
-                    last_ts = current_ts;
-                    last_x = events[i].vector.x;
-                    last_y = events[i].vector.y;
-                    last_z = events[i].vector.z;
-                    continue;
-                }
-
-                // Calculate exact delta time in seconds
-                float dt = (current_ts - last_ts) / 1000000000.0f;
-                if (dt <= 0.0001f || dt > 0.1f) dt = 0.01f; // Fallback for anomalous polling gaps
-
-                float raw_x = events[i].vector.x;
-                float raw_y = events[i].vector.y;
-                float raw_z = events[i].vector.z;
-
-                // Process axes individually
-                events[i].vector.x = process_axis(raw_x, last_x, dt);
-                events[i].vector.y = process_axis(raw_y, last_y, dt);
-                events[i].vector.z = process_axis(raw_z, last_z, dt);
-                
-                last_ts = current_ts;
+            // 1. Gather raw unadulterated hardware data
+            if (events[i].type == ASENSOR_TYPE_ACCELEROMETER) {
+                accel_data[0] = events[i].acceleration.x;
+                accel_data[1] = events[i].acceleration.y;
+                accel_data[2] = events[i].acceleration.z;
+                latest_ts = events[i].timestamp;
+                fusion_ready = true;
+            } 
+            else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || events[i].type == 14) {
+                mag_data[0] = events[i].uncalibrated_magnetic.x_uncalib - HARD_IRON_X;
+                mag_data[1] = events[i].uncalibrated_magnetic.y_uncalib - HARD_IRON_Y;
+                mag_data[2] = events[i].uncalibrated_magnetic.z_uncalib - HARD_IRON_Z;
+                if (!fusion_ready) latest_ts = events[i].timestamp;
+                fusion_ready = true;
             }
+            else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD) {
+                mag_data[0] = events[i].magnetic.x;
+                mag_data[1] = events[i].magnetic.y;
+                mag_data[2] = events[i].magnetic.z;
+                if (!fusion_ready) latest_ts = events[i].timestamp;
+                fusion_ready = true;
+            }
+            
+            // 2. Feed our Custom Delta-Quaternion Engine to the game
+            else if (events[i].type == ASENSOR_TYPE_GYROSCOPE || events[i].type == 4 || events[i].type == 16) {
+                events[i].vector.x = final_gyro[0]; 
+                events[i].vector.y = final_gyro[1]; 
+                events[i].vector.z = final_gyro[2]; 
+            }
+            
+            // 3. Hijack Rotation Vector (Forces CODM to trust our Quaternion state, not MediaTek's)
+            else if (events[i].type == ASENSOR_TYPE_ROTATION_VECTOR || events[i].type == 11 || events[i].type == 15) {
+                // Android uses [X, Y, Z, W] format for sensor events
+                events[i].data[0] = prev_q[1]; // X
+                events[i].data[1] = prev_q[2]; // Y
+                events[i].data[2] = prev_q[3]; // Z
+                events[i].data[3] = prev_q[0]; // W
+            }
+        }
+
+        // Fire the physics calculation once all sensor data in the current poll is collected
+        if (fusion_ready && latest_ts > 0) {
+            compute_pure_kinematics(latest_ts);
         }
     }
     return actual_events;
 }
 
 int hook_ASensorEventQueue_setEventRate(ASensorEventQueue* queue, ASensor const* sensor, int32_t usec) {
+    // Override MediaTek polling limitations, request maximum hardware speed (0 microseconds delay)
     return orig_setEventRate(queue, sensor, 0); 
 }
 
@@ -112,6 +204,7 @@ public:
     void onLoad(zygisk::Api* api, JNIEnv* env) override { this->api = api; this->env = env; }
     void preAppSpecialize(zygisk::AppSpecializeArgs* args) override {
         const char* process = env->GetStringUTFChars(args->nice_name, nullptr);
+        // Inject exclusively into Call of Duty Mobile
         if (process && strcmp(process, "com.activision.callofduty.shooter") == 0) { 
             enable_hack = true; 
         }
