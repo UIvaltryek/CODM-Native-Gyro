@@ -6,7 +6,6 @@
 #include "zygisk.hpp"
 
 // --- HARDWARE CALIBRATION ---
-// Your exact MT6835 Hard-Iron Biases
 static const float HARD_IRON_X = 93.76f;
 static const float HARD_IRON_Y = -29.09f;
 static const float HARD_IRON_Z = 967.01f;
@@ -15,10 +14,11 @@ static const float HARD_IRON_Z = 967.01f;
 static float accel_data[3] = {0.0f, 0.0f, 9.81f};
 static float mag_data[3] = {0.0f, 1.0f, 0.0f};
 
-// Quaternion state: [W, X, Y, Z]
-static float prev_q[4] = {1.0f, 0.0f, 0.0f, 0.0f};
-static float final_gyro[3] = {0.0f, 0.0f, 0.0f};
+// We track the last normalized vectors to calculate the derivative (Rate of Change)
+static float last_A[3] = {0.0f, 0.0f, 1.0f};
+static float last_M[3] = {0.0f, 1.0f, 0.0f};
 
+static float final_gyro[3] = {0.0f, 0.0f, 0.0f};
 static int64_t prev_ts = 0;
 static bool is_initialized = false;
 
@@ -27,104 +27,77 @@ static getEvents_t orig_getEvents = nullptr;
 typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
 static setEventRate_t orig_setEventRate = nullptr;
 
-// AOSP Rotation Matrix Generation
-bool calculateRotationMatrix(float R[9], float A[3], float E[3]) {
-    float normA = sqrt(A[0]*A[0] + A[1]*A[1] + A[2]*A[2]);
-    if (normA < 0.1f) return false;
-    float ax = A[0]/normA, ay = A[1]/normA, az = A[2]/normA;
-
-    // Cross Product: Mag x Accel = "East" vector
-    float Hx = E[1]*az - E[2]*ay;
-    float Hy = E[2]*ax - E[0]*az;
-    float Hz = E[0]*ay - E[1]*ax;
-    float normH = sqrt(Hx*Hx + Hy*Hy + Hz*Hz);
-    if (normH < 0.1f) return false;
-    Hx /= normH; Hy /= normH; Hz /= normH;
-
-    // Cross Product: Accel x East = "North" vector
-    float Mx = ay*Hz - az*Hy;
-    float My = az*Hx - ax*Hz;
-    float Mz = ax*Hy - ay*Hx;
-
-    R[0] = Hx; R[1] = Hy; R[2] = Hz;
-    R[3] = Mx; R[4] = My; R[5] = Mz;
-    R[6] = ax; R[7] = ay; R[8] = az;
-    return true;
-}
-
-// Convert Rotation Matrix strictly to Quaternion [W, X, Y, Z]
-void matrixToQuaternion(float R[9], float q[4]) {
-    float trace = R[0] + R[4] + R[8];
-    if (trace > 0.0f) {
-        float s = sqrt(trace + 1.0f) * 2.0f;
-        q[0] = 0.25f * s; // W
-        q[1] = (R[7] - R[5]) / s; // X
-        q[2] = (R[2] - R[6]) / s; // Y
-        q[3] = (R[3] - R[1]) / s; // Z
-    } else if ((R[0] > R[4]) && (R[0] > R[8])) {
-        float s = sqrt(1.0f + R[0] - R[4] - R[8]) * 2.0f;
-        q[0] = (R[7] - R[5]) / s; // W
-        q[1] = 0.25f * s; // X
-        q[2] = (R[3] + R[1]) / s; // Y
-        q[3] = (R[2] + R[6]) / s; // Z
-    } else if (R[4] > R[8]) {
-        float s = sqrt(1.0f + R[4] - R[0] - R[8]) * 2.0f;
-        q[0] = (R[2] - R[6]) / s; // W
-        q[1] = (R[3] + R[1]) / s; // X
-        q[2] = 0.25f * s; // Y
-        q[3] = (R[7] + R[5]) / s; // Z
-    } else {
-        float s = sqrt(1.0f + R[8] - R[0] - R[4]) * 2.0f;
-        q[0] = (R[3] - R[1]) / s; // W
-        q[1] = (R[2] + R[6]) / s; // X
-        q[2] = (R[7] + R[5]) / s; // Y
-        q[3] = 0.25f * s; // Z
-    }
-}
-
-// The Core Kinematic Engine
-void compute_pure_kinematics(int64_t timestamp) {
-    float R[9];
-    float curr_q[4];
-
-    if (!calculateRotationMatrix(R, accel_data, mag_data)) return;
-    matrixToQuaternion(R, curr_q);
-
+// THE PATCHUP: Pure Vector Derivative Kinematics
+void compute_algebraic_kinematics(int64_t timestamp) {
     if (!is_initialized) {
-        prev_q[0] = curr_q[0]; prev_q[1] = curr_q[1];
-        prev_q[2] = curr_q[2]; prev_q[3] = curr_q[3];
         prev_ts = timestamp;
         is_initialized = true;
         return;
     }
 
     float dt = (timestamp - prev_ts) / 1000000000.0f;
-    if (dt <= 0.0f || dt > 0.2f) dt = 0.016f; // Fallback to 60hz frame time
+    if (dt <= 0.0f || dt > 0.1f) dt = 0.016f; // Fallback to 60Hz frame time
 
-    // Quaternion Double Cover Check (Prevents random 180-degree snapping)
-    float dot_product = (prev_q[0] * curr_q[0]) + (prev_q[1] * curr_q[1]) + 
-                        (prev_q[2] * curr_q[2]) + (prev_q[3] * curr_q[3]);
-    if (dot_product < 0.0f) {
-        curr_q[0] = -curr_q[0]; curr_q[1] = -curr_q[1];
-        curr_q[2] = -curr_q[2]; curr_q[3] = -curr_q[3];
-    }
+    // 1. Normalize Accelerometer (A)
+    float ax = accel_data[0], ay = accel_data[1], az = accel_data[2];
+    float norm_a = sqrt(ax*ax + ay*ay + az*az);
+    if (norm_a > 0.001f) { ax /= norm_a; ay /= norm_a; az /= norm_a; }
 
-    // Calculate Delta Quaternion: q_delta = prev_q^-1 * curr_q
-    // prev_q^-1 is simply [W, -X, -Y, -Z]
-    float dw = prev_q[0]*curr_q[0] - (-prev_q[1])*curr_q[1] - (-prev_q[2])*curr_q[2] - (-prev_q[3])*curr_q[3];
-    float dx = prev_q[0]*curr_q[1] + (-prev_q[1])*curr_q[0] + (-prev_q[2])*curr_q[3] - (-prev_q[3])*curr_q[2];
-    float dy = prev_q[0]*curr_q[2] - (-prev_q[1])*curr_q[3] + (-prev_q[2])*curr_q[0] + (-prev_q[3])*curr_q[1];
-    float dz = prev_q[0]*curr_q[3] + (-prev_q[1])*curr_q[2] - (-prev_q[2])*curr_q[1] + (-prev_q[3])*curr_q[0];
+    // 2. Normalize Magnetometer (M)
+    float mx = mag_data[0], my = mag_data[1], mz = mag_data[2];
+    float norm_m = sqrt(mx*mx + my*my + mz*mz);
+    if (norm_m > 0.001f) { mx /= norm_m; my /= norm_m; mz /= norm_m; }
 
-    // Extract Pure Angular Velocity (rad/s)
-    // Formula: omega = 2 * (q_delta_vector) / dt
-    final_gyro[0] = (2.0f * dx) / dt;
-    final_gyro[1] = (2.0f * dy) / dt;
-    final_gyro[2] = (2.0f * dz) / dt;
+    // 3. Calculate Vector Derivatives (How fast are the sensors physically changing?)
+    float dAx = (ax - last_A[0]) / dt;
+    float dAy = (ay - last_A[1]) / dt;
+    float dAz = (az - last_A[2]) / dt;
 
-    // Save state for the next frame
-    prev_q[0] = curr_q[0]; prev_q[1] = curr_q[1];
-    prev_q[2] = curr_q[2]; prev_q[3] = curr_q[3];
+    float dMx = (mx - last_M[0]) / dt;
+    float dMy = (my - last_M[1]) / dt;
+    float dMz = (mz - last_M[2]) / dt;
+
+    // ==========================================
+    // EQUATION 1: Pitch & Roll (A × dA)
+    // Extracts velocity strictly from Gravity tilting
+    // ==========================================
+    float wx_perp = ay * dAz - az * dAy;
+    float wy_perp = az * dAx - ax * dAz;
+    float wz_perp = ax * dAy - ay * dAx;
+
+    // ==========================================
+    // EQUATION 2: Yaw (Magnetic Sweep)
+    // Formula: A * [ A · (M × dM) / |A × M|^2 ]
+    // Funnels magnetic sweeping perfectly onto the gravity axis.
+    // ==========================================
+    
+    // Part A: (M × dM)
+    float m_cross_x = my * dMz - mz * dMy;
+    float m_cross_y = mz * dMx - mx * dMz;
+    float m_cross_z = mx * dMy - my * dMx;
+
+    // Part B: A · (M × dM)
+    float dot_A_Mdot = ax * m_cross_x + ay * m_cross_y + az * m_cross_z;
+
+    // Part C: |A × M|^2 
+    float Hx = ay * mz - az * my;
+    float Hy = az * mx - ax * mz;
+    float Hz = ax * my - ay * mx;
+    float mag_H2 = Hx*Hx + Hy*Hy + Hz*Hz;
+
+    // Calculate the Yaw Scalar multiplier (added 0.000001f to prevent division by zero at magnetic poles)
+    float yaw_scalar = dot_A_Mdot / (mag_H2 + 0.000001f);
+
+    // ==========================================
+    // FINAL FUSION
+    // ==========================================
+    final_gyro[0] = wx_perp + (ax * yaw_scalar);
+    final_gyro[1] = wy_perp + (ay * yaw_scalar);
+    final_gyro[2] = wz_perp + (az * yaw_scalar);
+
+    // Save states for next frame derivative calculation
+    last_A[0] = ax; last_A[1] = ay; last_A[2] = az;
+    last_M[0] = mx; last_M[1] = my; last_M[2] = mz;
     prev_ts = timestamp;
 }
 
@@ -136,7 +109,7 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
 
         for (ssize_t i = 0; i < actual_events; i++) {
             
-            // 1. Gather raw unadulterated hardware data
+            // 1. Gather raw hardware data
             if (events[i].type == ASENSOR_TYPE_ACCELEROMETER) {
                 accel_data[0] = events[i].acceleration.x;
                 accel_data[1] = events[i].acceleration.y;
@@ -159,33 +132,23 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                 fusion_ready = true;
             }
             
-            // 2. Feed our Custom Delta-Quaternion Engine to the game
+            // 2. Feed our direct kinematic velocity to the game
             else if (events[i].type == ASENSOR_TYPE_GYROSCOPE || events[i].type == 4 || events[i].type == 16) {
                 events[i].vector.x = final_gyro[0]; 
                 events[i].vector.y = final_gyro[1]; 
                 events[i].vector.z = final_gyro[2]; 
             }
-            
-            // 3. Hijack Rotation Vector (Forces CODM to trust our Quaternion state, not MediaTek's)
-            else if (events[i].type == ASENSOR_TYPE_ROTATION_VECTOR || events[i].type == 11 || events[i].type == 15) {
-                // Android uses [X, Y, Z, W] format for sensor events
-                events[i].data[0] = prev_q[1]; // X
-                events[i].data[1] = prev_q[2]; // Y
-                events[i].data[2] = prev_q[3]; // Z
-                events[i].data[3] = prev_q[0]; // W
-            }
         }
 
-        // Fire the physics calculation once all sensor data in the current poll is collected
+        // Fire the physics calculation
         if (fusion_ready && latest_ts > 0) {
-            compute_pure_kinematics(latest_ts);
+            compute_algebraic_kinematics(latest_ts);
         }
     }
     return actual_events;
 }
 
 int hook_ASensorEventQueue_setEventRate(ASensorEventQueue* queue, ASensor const* sensor, int32_t usec) {
-    // Override MediaTek polling limitations, request maximum hardware speed (0 microseconds delay)
     return orig_setEventRate(queue, sensor, 0); 
 }
 
@@ -204,18 +167,11 @@ public:
     void onLoad(zygisk::Api* api, JNIEnv* env) override { this->api = api; this->env = env; }
     void preAppSpecialize(zygisk::AppSpecializeArgs* args) override {
         const char* process = env->GetStringUTFChars(args->nice_name, nullptr);
-        // Inject exclusively into Call of Duty Mobile
-        if (process && strcmp(process, "com.activision.callofduty.shooter") == 0) { 
-            enable_hack = true; 
-        }
+        if (process && strcmp(process, "com.activision.callofduty.shooter") == 0) { enable_hack = true; }
         env->ReleaseStringUTFChars(args->nice_name, process);
     }
-    void postAppSpecialize(const zygisk::AppSpecializeArgs*) override { 
-        if (enable_hack) install_hook(); 
-    }
+    void postAppSpecialize(const zygisk::AppSpecializeArgs*) override { if (enable_hack) install_hook(); }
 private:
-    zygisk::Api* api = nullptr; 
-    JNIEnv* env = nullptr; 
-    bool enable_hack = false;
+    zygisk::Api* api = nullptr; JNIEnv* env = nullptr; bool enable_hack = false;
 };
 REGISTER_ZYGISK_MODULE(GyroModifier)
