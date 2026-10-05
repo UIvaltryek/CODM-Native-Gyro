@@ -87,14 +87,6 @@ float dot_product(float a[3], float b[3]) {
     return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
 }
 
-float apply_deadzone_spring(float raw_velocity) {
-    if (fabs(raw_velocity) > NOISE_GATE) {
-        float sign = (raw_velocity > 0.0f) ? 1.0f : -1.0f;
-        return raw_velocity + (sign * BOOST_OFFSET);
-    }
-    return 0.0f;
-}
-
 void compute_direct_kinematics() {
     float dot_A[3], dot_M[3];
     
