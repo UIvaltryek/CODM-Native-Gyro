@@ -5,148 +5,89 @@
 #include "dobby.h"
 #include "zygisk.hpp"
 
-// --- TUNABLE PARAMETERS ---
-static const float SENSITIVITY = 1.0f; 
-static const float NOISE_GATE = 0.003f;
-static const float FILTER_COEFFICIENT = 0.85f; 
+// --- MIDDLEMAN TUNABLE PARAMETERS ---
 
-// Exact CPU X Factory Biases for MT6835
-static const float HARD_IRON_X = 93.76f;
-static const float HARD_IRON_Y = -29.09f;
-static const float HARD_IRON_Z = 967.01f;
+// 1. The Deadzone Spring
+static const float NOISE_GATE = 0.005f;      // Ignore autonomous wobbling below this rad/s
+static const float BOOST_OFFSET = 0.13999f;  // Your exact pre-tensioning offset
+static const float FADE_THRESHOLD = 0.5f;    // Speed (rad/s) where the boost completely fades to 0.0 to preserve fast flicks
 
-// --- STATE VARIABLES ---
-static float accelReading[3] = {0.0f, 0.0f, 9.81f};
-static float magReading[3] = {0.0f, 1.0f, 0.0f};
+// 2. The Inverse Filter (Lead Compensator)
+// Represents the time-constant (in seconds) of MediaTek's lag. 
+// A value of 0.05f looks 50 milliseconds into the future to cancel the phase lag.
+// Increase to 0.10f if the ending "ice-slide" lag is still too long.
+static const float SHARPNESS = 0.05f; 
 
-static float lastRotationMatrix[9] = {1,0,0, 0,1,0, 0,0,1};
-static bool isInitialized = false;
+// --- STATE TRACKERS ---
+static float last_x = 0.0f;
+static float last_y = 0.0f;
+static float last_z = 0.0f;
 static int64_t last_ts = 0;
-
-static float smooth_gyro[3] = {0.0f, 0.0f, 0.0f};
-static float final_gyro[3] = {0.0f, 0.0f, 0.0f};
 
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
 static getEvents_t orig_getEvents = nullptr;
 typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
 static setEventRate_t orig_setEventRate = nullptr;
 
-// Hardware Noise Filter (Reduced filtering for faster response)
-void lowPass(float input[3], float output[3]) {
-    float alpha = 0.6f; // Changed from 0.2f to 0.6f
-    for (int i = 0; i < 3; i++) {
-        output[i] = output[i] + alpha * (input[i] - output[i]);
+float process_axis(float current_val, float &last_val, float dt) {
+    // 1. DECONVOLUTION (Kill Start/End Lag)
+    // Calculate exact acceleration (Derivative)
+    float derivative = (current_val - last_val) / dt;
+    
+    // Add the predictive lead to cancel MediaTek's low-pass buffer
+    float sharpened = current_val + (SHARPNESS * derivative);
+    last_val = current_val;
+
+    // 2. THE DIGITAL BRAKE & NOISE GATE
+    if (fabs(sharpened) < NOISE_GATE) {
+        return 0.0f; 
     }
-}
 
-bool getRotationMatrix(float R[9], float gravity[3], float geomagnetic[3]) {
-    float Ax = gravity[0], Ay = gravity[1], Az = gravity[2];
-    float normA = sqrt(Ax*Ax + Ay*Ay + Az*Az);
-    if (normA < 0.1f) return false;
-    Ax /= normA; Ay /= normA; Az /= normA;
+    // 3. DEADZONE SPRING (with Linear Fade)
+    float sign = (sharpened > 0.0f) ? 1.0f : -1.0f;
+    
+    // Calculate how much boost to apply.
+    // At 0.005 rad/s, it applies nearly 100% of 0.13999.
+    // At >= 0.5 rad/s, the boost drops to exactly 0.0, leaving your fast flicks perfectly natural.
+    float fade_factor = fmax(0.0f, 1.0f - (fabs(sharpened) / FADE_THRESHOLD));
+    float dynamic_boost = BOOST_OFFSET * fade_factor;
 
-    float Ex = geomagnetic[1] * Az - geomagnetic[2] * Ay;
-    float Ey = geomagnetic[2] * Ax - geomagnetic[0] * Az;
-    float Ez = geomagnetic[0] * Ay - geomagnetic[1] * Ax;
-    float normE = sqrt(Ex*Ex + Ey*Ey + Ez*Ez);
-    if (normE < 0.1f) return false;
-    Ex /= normE; Ey /= normE; Ez /= normE;
-
-    float Nx = Ay * Ez - Az * Ey;
-    float Ny = Az * Ex - Ax * Ez;
-    float Nz = Ax * Ey - Ay * Ex;
-
-    R[0] = Ex; R[1] = Ey; R[2] = Ez;
-    R[3] = Nx; R[4] = Ny; R[5] = Nz;
-    R[6] = Ax; R[7] = Ay; R[8] = Az;
-    return true;
-}
-
-void compute_sensor_fusion(int64_t ts) {
-    float C[9];
-    bool success = getRotationMatrix(C, accelReading, magReading);
-
-    if (success) {
-        if (!isInitialized) {
-            memcpy(lastRotationMatrix, C, sizeof(float) * 9);
-            isInitialized = true;
-            last_ts = ts;
-            return;
-        }
-
-        float dt = (ts - last_ts) / 1000000000.0f;
-        if (dt > 0.001f && dt < 0.1f) {
-            
-            float L[9];
-            memcpy(L, lastRotationMatrix, sizeof(float) * 9);
-            float dR[9];
-
-            dR[0] = L[0]*C[0] + L[3]*C[3] + L[6]*C[6];
-            dR[1] = L[0]*C[1] + L[3]*C[4] + L[6]*C[7];
-            dR[2] = L[0]*C[2] + L[3]*C[5] + L[6]*C[8];
-            
-            dR[3] = L[1]*C[0] + L[4]*C[3] + L[7]*C[6];
-            dR[4] = L[1]*C[1] + L[4]*C[4] + L[7]*C[7];
-            dR[5] = L[1]*C[2] + L[4]*C[5] + L[7]*C[8];
-            
-            dR[6] = L[2]*C[0] + L[5]*C[3] + L[8]*C[6];
-            dR[7] = L[2]*C[1] + L[5]*C[4] + L[8]*C[7];
-            dR[8] = L[2]*C[2] + L[5]*C[5] + L[8]*C[8];
-
-            float raw_gyro_x = (dR[7] - dR[5]) / (2.0f * dt); 
-            float raw_gyro_y = (dR[2] - dR[6]) / (2.0f * dt); 
-            float raw_gyro_z = (dR[3] - dR[1]) / (2.0f * dt); 
-
-            smooth_gyro[0] = (FILTER_COEFFICIENT * smooth_gyro[0]) + ((1.0f - FILTER_COEFFICIENT) * raw_gyro_x);
-            smooth_gyro[1] = (FILTER_COEFFICIENT * smooth_gyro[1]) + ((1.0f - FILTER_COEFFICIENT) * raw_gyro_y);
-            smooth_gyro[2] = (FILTER_COEFFICIENT * smooth_gyro[2]) + ((1.0f - FILTER_COEFFICIENT) * raw_gyro_z);
-
-            final_gyro[0] = (fabs(smooth_gyro[0]) > NOISE_GATE) ? smooth_gyro[0] * SENSITIVITY : 0.0f;
-            final_gyro[1] = (fabs(smooth_gyro[1]) > NOISE_GATE) ? smooth_gyro[1] * SENSITIVITY : 0.0f;
-            final_gyro[2] = (fabs(smooth_gyro[2]) > NOISE_GATE) ? smooth_gyro[2] * SENSITIVITY : 0.0f;
-        }
-        
-        memcpy(lastRotationMatrix, C, sizeof(float) * 9);
-        last_ts = ts;
-    }
+    // Output the lag-free signal + the deadzone spring
+    return sharpened + (sign * dynamic_boost);
 }
 
 ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent* events, size_t count) {
     ssize_t actual_events = orig_getEvents(queue, events, count);
     if (actual_events > 0) {
-        bool fusion_ready = false;
-        int64_t latest_ts = 0;
-
         for (ssize_t i = 0; i < actual_events; i++) {
-            if (events[i].type == ASENSOR_TYPE_ACCELEROMETER) {
-                lowPass(events[i].acceleration.v, accelReading);
-                latest_ts = events[i].timestamp;
-                fusion_ready = true;
-            } 
-            else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || events[i].type == 14) {
-                float raw_mag[3] = {
-                    events[i].uncalibrated_magnetic.x_uncalib - HARD_IRON_X,
-                    events[i].uncalibrated_magnetic.y_uncalib - HARD_IRON_Y,
-                    events[i].uncalibrated_magnetic.z_uncalib - HARD_IRON_Z
-                };
-                lowPass(raw_mag, magReading);
-                if (!fusion_ready) latest_ts = events[i].timestamp; 
-                fusion_ready = true;
-            } 
-            else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD) {
-                lowPass(events[i].magnetic.v, magReading);
-                if (!fusion_ready) latest_ts = events[i].timestamp;
-                fusion_ready = true;
-            } 
-            else if (events[i].type == ASENSOR_TYPE_GYROSCOPE) {
-                events[i].vector.x = final_gyro[0]; 
-                events[i].vector.y = final_gyro[1]; 
-                events[i].vector.z = final_gyro[2]; 
-            }
-        }
+            
+            // Intercept standard Gyroscope (Type 4) and Uncalibrated Gyroscope (Type 16)
+            if (events[i].type == ASENSOR_TYPE_GYROSCOPE || events[i].type == 16) {
+                
+                int64_t current_ts = events[i].timestamp;
+                if (last_ts == 0) {
+                    last_ts = current_ts;
+                    last_x = events[i].vector.x;
+                    last_y = events[i].vector.y;
+                    last_z = events[i].vector.z;
+                    continue;
+                }
 
-        if (fusion_ready && latest_ts > 0) {
-            compute_sensor_fusion(latest_ts);
+                // Calculate exact delta time in seconds
+                float dt = (current_ts - last_ts) / 1000000000.0f;
+                if (dt <= 0.0001f || dt > 0.1f) dt = 0.01f; // Fallback for anomalous polling gaps
+
+                float raw_x = events[i].vector.x;
+                float raw_y = events[i].vector.y;
+                float raw_z = events[i].vector.z;
+
+                // Process axes individually
+                events[i].vector.x = process_axis(raw_x, last_x, dt);
+                events[i].vector.y = process_axis(raw_y, last_y, dt);
+                events[i].vector.z = process_axis(raw_z, last_z, dt);
+                
+                last_ts = current_ts;
+            }
         }
     }
     return actual_events;
@@ -160,13 +101,9 @@ void install_hook() {
     void* libandroid = dlopen("libandroid.so", RTLD_NOW);
     if (libandroid) {
         void* target_get = dlsym(libandroid, "ASensorEventQueue_getEvents");
-        if (target_get) {
-            DobbyHook(target_get, (dobby_dummy_func_t)hook_ASensorEventQueue_getEvents, (dobby_dummy_func_t*)&orig_getEvents);
-        }
+        if (target_get) DobbyHook(target_get, (dobby_dummy_func_t)hook_ASensorEventQueue_getEvents, (dobby_dummy_func_t*)&orig_getEvents);
         void* target_rate = dlsym(libandroid, "ASensorEventQueue_setEventRate");
-        if (target_rate) {
-            DobbyHook(target_rate, (dobby_dummy_func_t)hook_ASensorEventQueue_setEventRate, (dobby_dummy_func_t*)&orig_setEventRate);
-        }
+        if (target_rate) DobbyHook(target_rate, (dobby_dummy_func_t)hook_ASensorEventQueue_setEventRate, (dobby_dummy_func_t*)&orig_setEventRate);
     }
 }
 
@@ -175,11 +112,17 @@ public:
     void onLoad(zygisk::Api* api, JNIEnv* env) override { this->api = api; this->env = env; }
     void preAppSpecialize(zygisk::AppSpecializeArgs* args) override {
         const char* process = env->GetStringUTFChars(args->nice_name, nullptr);
-        if (process && strcmp(process, "com.activision.callofduty.shooter") == 0) { enable_hack = true; }
+        if (process && strcmp(process, "com.activision.callofduty.shooter") == 0) { 
+            enable_hack = true; 
+        }
         env->ReleaseStringUTFChars(args->nice_name, process);
     }
-    void postAppSpecialize(const zygisk::AppSpecializeArgs*) override { if (enable_hack) install_hook(); }
+    void postAppSpecialize(const zygisk::AppSpecializeArgs*) override { 
+        if (enable_hack) install_hook(); 
+    }
 private:
-    zygisk::Api* api = nullptr; JNIEnv* env = nullptr; bool enable_hack = false;
+    zygisk::Api* api = nullptr; 
+    JNIEnv* env = nullptr; 
+    bool enable_hack = false;
 };
 REGISTER_ZYGISK_MODULE(GyroModifier)
