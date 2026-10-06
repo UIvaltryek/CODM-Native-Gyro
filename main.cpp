@@ -5,7 +5,7 @@
 #include "dobby.h"
 #include "zygisk.hpp"
 
-// Production Build: All logging and filters removed for raw 1:1 input
+// Production Build: Raw Direct Feed, Uncalibrated Mag, No Filters
 static const float MAG_NOISE_GATE = 0.015f; 
 
 // --- FACTORY BIASES (MT6835 Hard-Iron Offsets) ---
@@ -40,13 +40,14 @@ void compute_sensor_fusion(int64_t timestamp) {
 
     float gx = ax / G; float gy = ay / G; float gz = az / G; 
 
+    // Original Pitch and Roll Extraction
     float pitch = atan2(ay, az); 
-
     float normalized_ax = -ax / G; 
     if (normalized_ax > 1.0f) normalized_ax = 1.0f; 
     if (normalized_ax < -1.0f) normalized_ax = -1.0f; 
     float roll = asin(normalized_ax); 
 
+    // Original Horizontal Magnetic Projection
     float dot_mg = mx * gx + my * gy + mz * gz; 
     float hx = mx - dot_mg * gx; 
     float hy = my - dot_mg * gy; 
@@ -69,29 +70,44 @@ void compute_sensor_fusion(int64_t timestamp) {
         return; 
     }
 
-    float speed_pitch = (pitch - last_pitch) / raw_dt; 
-    float speed_roll = (roll - last_roll) / raw_dt; 
+    // Pitch Velocity (with boundary wrap protection)
+    float delta_pitch = pitch - last_pitch;
+    while (delta_pitch > M_PI) delta_pitch -= 2.0f * M_PI;
+    while (delta_pitch < -M_PI) delta_pitch += 2.0f * M_PI;
+    float speed_pitch = delta_pitch / raw_dt; 
 
-    float dot_h = hx * last_hx + hy * last_hy + hz * last_hz; 
-    if (dot_h > 1.0f) dot_h = 1.0f; 
-    if (dot_h < -1.0f) dot_h = -1.0f; 
-    float mag_delta_yaw = acos(dot_h); 
+    // Roll Velocity (with boundary wrap protection)
+    float delta_roll = roll - last_roll;
+    while (delta_roll > M_PI) delta_roll -= 2.0f * M_PI;
+    while (delta_roll < -M_PI) delta_roll += 2.0f * M_PI;
+    float speed_roll = delta_roll / raw_dt; 
 
+    // --- THE ANTI-SNAP YAW FIX ---
+    // Calculate the cross product to measure swept area instead of absolute angle
     float cx = last_hy * hz - last_hz * hy; 
     float cy = last_hz * hx - last_hx * hz; 
     float cz = last_hx * hy - last_hy * hx; 
     
-    float direction = cx * gx + cy * gy + cz * gz; 
-    if (direction < 0.0f) mag_delta_yaw = -mag_delta_yaw; 
-
+    // Because h and last_h are unit vectors, their cross product projected onto gravity 
+    // exactly equals the sine of the angle between them.
+    float sin_yaw = cx * gx + cy * gy + cz * gz; 
+    
+    if (sin_yaw > 1.0f) sin_yaw = 1.0f;
+    if (sin_yaw < -1.0f) sin_yaw = -1.0f;
+    
+    // asin naturally returns 0 if the vector artificially flips 180 degrees
+    float mag_delta_yaw = asin(sin_yaw); 
+    
     float speed_yaw = mag_delta_yaw / raw_dt; 
     if (fabs(speed_yaw) < MAG_NOISE_GATE) speed_yaw = 0.0f; 
 
+    // --- YOUR ORIGINAL FADE FACTOR ---
     float fade_factor = pow(fabs(sin(pitch)), 4.0f); 
     
+    // Masterpiece Synthesis
     float final_horizontal_speed = (speed_roll * (1.0f - fade_factor)) + (speed_yaw * fade_factor); 
 
-    // DIRECT FEED (No ALPHA_ACCEL Low-Pass Filter)
+    // Direct Feed (Raw input, no smoothing filters)
     final_gyro[0] = speed_pitch; 
     final_gyro[1] = final_horizontal_speed; 
     final_gyro[2] = 0.0f; 
