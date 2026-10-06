@@ -5,7 +5,11 @@
 #include "dobby.h"
 #include "zygisk.hpp"
 
-// Production Build: Raw Direct Feed, Uncalibrated Mag, No Filters
+// --- MAHONY AHRS TUNING ---
+// Kp: Proportional gain (Higher = snaps to Accelerometer/Magnetometer faster)
+// Ki: Integral gain (Higher = eliminates steady-state drift faster)
+static const float Kp = 2.0f; 
+static const float Ki = 0.005f; 
 static const float MAG_NOISE_GATE = 0.015f; 
 
 // --- FACTORY BIASES (MT6835 Hard-Iron Offsets) ---
@@ -26,10 +30,87 @@ static float last_hx = 0.0f;
 static float last_hy = 1.0f; 
 static float last_hz = 0.0f; 
 
+// Mahony States
+static float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
+static float eIntX = 0.0f, eIntY = 0.0f, eIntZ = 0.0f;
+
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t); 
 static getEvents_t orig_getEvents = nullptr; 
 typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
 static setEventRate_t orig_setEventRate = nullptr;
+
+// --- MAHONY AHRS UPDATE (Modified to output compensated Gyro) ---
+void MahonyAHRSupdate(float gx, float gy, float gz, float ax, float ay, float az, float mx, float my, float mz, float dt, float& out_gx, float& out_gy, float& out_gz) {
+    float recipNorm;
+    float q0q0, q0q1, q0q2, q0q3, q1q1, q1q2, q1q3, q2q2, q2q3, q3q3;
+    float hx, hy, bx, bz;
+    float halfvx, halfvy, halfvz, halfwx, halfwy, halfwz;
+    float halfex, halfey, halfez;
+    float qa, qb, qc;
+
+    if(!((ax == 0.0f) && (ay == 0.0f) && (az == 0.0f))) {
+        // Normalize accelerometer
+        recipNorm = 1.0f / sqrt(ax * ax + ay * ay + az * az);
+        ax *= recipNorm; ay *= recipNorm; az *= recipNorm;
+
+        // Normalize magnetometer
+        recipNorm = 1.0f / sqrt(mx * mx + my * my + mz * mz);
+        mx *= recipNorm; my *= recipNorm; mz *= recipNorm;
+
+        q0q0 = q0 * q0; q0q1 = q0 * q1; q0q2 = q0 * q2; q0q3 = q0 * q3;
+        q1q1 = q1 * q1; q1q2 = q1 * q2; q1q3 = q1 * q3;
+        q2q2 = q2 * q2; q2q3 = q2 * q3; q3q3 = q3 * q3;
+
+        // Reference direction of Earth's magnetic field
+        hx = 2.0f * (mx * (0.5f - q2q2 - q3q3) + my * (q1q2 - q0q3) + mz * (q1q3 + q0q2));
+        hy = 2.0f * (mx * (q1q2 + q0q3) + my * (0.5f - q1q1 - q3q3) + mz * (q2q3 - q0q1));
+        bx = sqrt(hx * hx + hy * hy);
+        bz = 2.0f * (mx * (q1q3 - q0q2) + my * (q2q3 + q0q1) + mz * (0.5f - q1q1 - q2q2));
+
+        // Estimated direction of gravity and magnetic field
+        halfvx = q1q3 - q0q2;
+        halfvy = q0q1 + q2q3;
+        halfvz = q0q0 - 0.5f + q3q3;
+        halfwx = bx * (0.5f - q2q2 - q3q3) + bz * (q1q3 - q0q2);
+        halfwy = bx * (q1q2 - q0q3) + bz * (q0q1 + q2q3);
+        halfwz = bx * (q0q2 + q1q3) + bz * (0.5f - q1q1 - q2q2);
+
+        // Error is cross product between estimated and measured direction of vectors
+        halfex = (ay * halfvz - az * halfvy) + (my * halfwz - mz * halfwy);
+        halfey = (az * halfvx - ax * halfvz) + (mz * halfwx - mx * halfwz);
+        halfez = (ax * halfvy - ay * halfvx) + (mx * halfwy - my * halfwx);
+
+        // Compute and apply integral feedback
+        if(Ki > 0.0f) {
+            eIntX += Ki * halfex * dt;
+            eIntY += Ki * halfey * dt;
+            eIntZ += Ki * halfez * dt;
+            gx += eIntX; gy += eIntY; gz += eIntZ;
+        }
+
+        // Apply proportional feedback
+        gx += Kp * halfex;
+        gy += Kp * halfey;
+        gz += Kp * halfez;
+    }
+
+    // Capture the flawlessly error-corrected gyroscope data before it integrates to the quaternion!
+    out_gx = gx;
+    out_gy = gy;
+    out_gz = gz;
+
+    // Integrate rate of change to maintain the Quaternion filter foundation
+    gx *= (0.5f * dt); gy *= (0.5f * dt); gz *= (0.5f * dt);
+    qa = q0; qb = q1; qc = q2;
+    q0 += (-qb * gx - qc * gy - q3 * gz);
+    q1 += (qa * gx + qc * gz - q3 * gy);
+    q2 += (qa * gy - qb * gz + q3 * gx);
+    q3 += (qa * gz + qb * gy - qc * gx);
+
+    // Normalize quaternion
+    recipNorm = 1.0f / sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+    q0 *= recipNorm; q1 *= recipNorm; q2 *= recipNorm; q3 *= recipNorm;
+}
 
 void compute_sensor_fusion(int64_t timestamp) {
     float ax = last_accel[0]; float ay = last_accel[1]; float az = last_accel[2]; 
@@ -40,14 +121,14 @@ void compute_sensor_fusion(int64_t timestamp) {
 
     float gx = ax / G; float gy = ay / G; float gz = az / G; 
 
-    // Original Pitch and Roll Extraction
+    // Angular Position Extraction
     float pitch = atan2(ay, az); 
     float normalized_ax = -ax / G; 
     if (normalized_ax > 1.0f) normalized_ax = 1.0f; 
     if (normalized_ax < -1.0f) normalized_ax = -1.0f; 
     float roll = asin(normalized_ax); 
 
-    // Original Horizontal Magnetic Projection
+    // Horizontal Magnetic Plane Extraction
     float dot_mg = mx * gx + my * gy + mz * gz; 
     float hx = mx - dot_mg * gx; 
     float hy = my - dot_mg * gy; 
@@ -70,48 +151,39 @@ void compute_sensor_fusion(int64_t timestamp) {
         return; 
     }
 
-    // Pitch Velocity (with boundary wrap protection)
+    // 1. RAW ANGULAR VELOCITIES (Your Method)
     float delta_pitch = pitch - last_pitch;
     while (delta_pitch > M_PI) delta_pitch -= 2.0f * M_PI;
     while (delta_pitch < -M_PI) delta_pitch += 2.0f * M_PI;
-    float speed_pitch = delta_pitch / raw_dt; 
+    float raw_wx = delta_pitch / raw_dt; 
 
-    // Roll Velocity (with boundary wrap protection)
     float delta_roll = roll - last_roll;
     while (delta_roll > M_PI) delta_roll -= 2.0f * M_PI;
     while (delta_roll < -M_PI) delta_roll += 2.0f * M_PI;
-    float speed_roll = delta_roll / raw_dt; 
+    float raw_wy = delta_roll / raw_dt; 
 
-    // --- THE ANTI-SNAP YAW FIX ---
-    // Calculate the cross product to measure swept area instead of absolute angle
+    // Cross-Product Yaw Extraction (Anti-Snap Fix)
     float cx = last_hy * hz - last_hz * hy; 
     float cy = last_hz * hx - last_hx * hz; 
     float cz = last_hx * hy - last_hy * hx; 
-    
-    // Because h and last_h are unit vectors, their cross product projected onto gravity 
-    // exactly equals the sine of the angle between them.
     float sin_yaw = cx * gx + cy * gy + cz * gz; 
-    
     if (sin_yaw > 1.0f) sin_yaw = 1.0f;
     if (sin_yaw < -1.0f) sin_yaw = -1.0f;
-    
-    // asin naturally returns 0 if the vector artificially flips 180 degrees
     float mag_delta_yaw = asin(sin_yaw); 
     
-    float speed_yaw = mag_delta_yaw / raw_dt; 
-    if (fabs(speed_yaw) < MAG_NOISE_GATE) speed_yaw = 0.0f; 
+    float raw_wz = mag_delta_yaw / raw_dt; 
+    if (fabs(raw_wz) < MAG_NOISE_GATE) raw_wz = 0.0f; 
 
-    // --- YOUR ORIGINAL FADE FACTOR ---
-    float fade_factor = pow(fabs(sin(pitch)), 4.0f); 
-    
-    // Masterpiece Synthesis
-    float final_horizontal_speed = (speed_roll * (1.0f - fade_factor)) + (speed_yaw * fade_factor); 
+    // 2. MAHONY ERROR-CORRECTION FUSION
+    float clean_wx, clean_wy, clean_wz;
+    MahonyAHRSupdate(raw_wx, raw_wy, raw_wz, ax, ay, az, mx, my, mz, raw_dt, clean_wx, clean_wy, clean_wz);
 
-    // Direct Feed (Raw input, no smoothing filters)
-    final_gyro[0] = speed_pitch; 
-    final_gyro[1] = final_horizontal_speed; 
+    // 3. PURE DIRECT ADDITION (No Fade Factor, Strict Z-Axis Cull)
+    final_gyro[0] = clean_wx; 
+    final_gyro[1] = clean_wy + clean_wz; 
     final_gyro[2] = 0.0f; 
 
+    // Update States
     last_pitch = pitch; last_roll = roll; 
     last_hx = hx; last_hy = hy; last_hz = hz; 
     last_timestamp = timestamp; 
@@ -132,7 +204,6 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                 last_accel[2] = events[i].acceleration.z;
                 fusion_ready = true;
             } 
-            // STRICTLY UNCALIBRATED MAGNETOMETER WITH HARD-IRON OFFSETS
             else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || events[i].type == 14) {
                 last_mag[0] = events[i].uncalibrated_magnetic.x_uncalib - HARD_IRON_X;
                 last_mag[1] = events[i].uncalibrated_magnetic.y_uncalib - HARD_IRON_Y;
