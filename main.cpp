@@ -9,51 +9,49 @@
 static const float SENSITIVITY = 1.0f; 
 static const float STATIC_NOISE_GATE = 0.002f; 
 
-// MT6835 Hard-Iron Biases
-static const float HARD_IRON_X = 93.76f;
-static const float HARD_IRON_Y = -29.09f;
-static const float HARD_IRON_Z = 967.01f;
-
 // --- 5-FRAME SLIDING WINDOW (LINEAR REGRESSION) ---
+// Upgraded to Double-Precision relative time to prevent Float Truncation on high uptimes
 class RegressionBuffer {
 public:
-    float t[5] = {0};
+    int64_t t[5] = {0};
     float x[5] = {0}, y[5] = {0}, z[5] = {0};
     int index = 0;
     int count = 0;
 
-    void push(float time_sec, float vx, float vy, float vz) {
-        t[index] = time_sec; x[index] = vx; y[index] = vy; z[index] = vz;
+    void push(int64_t time_nanos, float vx, float vy, float vz) {
+        t[index] = time_nanos; x[index] = vx; y[index] = vy; z[index] = vz;
         index = (index + 1) % 5;
         if (count < 5) count++;
     }
 
     void derive(float& dx, float& dy, float& dz) {
-        if (count < 2) { dx = 0; dy = 0; dz = 0; return; }
+        if (count < 2) { dx = dy = dz = 0.0f; return; }
         
-        float sum_t = 0, sum_x = 0, sum_y = 0, sum_z = 0;
+        double sum_t = 0, sum_x = 0, sum_y = 0, sum_z = 0;
+        int64_t t0 = t[0]; // Normalize time to prevent float overflow
         for (int i = 0; i < count; i++) {
-            sum_t += t[i]; sum_x += x[i]; sum_y += y[i]; sum_z += z[i];
+            double dt = (t[i] - t0) / 1000000000.0;
+            sum_t += dt; sum_x += x[i]; sum_y += y[i]; sum_z += z[i];
         }
-        float mean_t = sum_t / count;
-        float mean_x = sum_x / count;
-        float mean_y = sum_y / count;
-        float mean_z = sum_z / count;
+        double mean_t = sum_t / count;
+        double mean_x = sum_x / count;
+        double mean_y = sum_y / count;
+        double mean_z = sum_z / count;
 
-        float num_x = 0, num_y = 0, num_z = 0, den = 0;
+        double num_x = 0, num_y = 0, num_z = 0, den = 0;
         for (int i = 0; i < count; i++) {
-            float dt = t[i] - mean_t;
+            double dt = ((t[i] - t0) / 1000000000.0) - mean_t;
             den += dt * dt;
             num_x += dt * (x[i] - mean_x);
             num_y += dt * (y[i] - mean_y);
             num_z += dt * (z[i] - mean_z);
         }
         
-        if (den < 1e-6f) { dx = 0; dy = 0; dz = 0; return; } 
+        if (den < 1e-9) { dx = dy = dz = 0.0f; return; } 
         
-        dx = num_x / den; 
-        dy = num_y / den; 
-        dz = num_z / den;
+        dx = (float)(num_x / den); 
+        dy = (float)(num_y / den); 
+        dz = (float)(num_z / den);
     }
 };
 
@@ -87,46 +85,41 @@ float dot_product(float a[3], float b[3]) {
 void compute_true_kinematics() {
     float dot_A[3], dot_M[3];
     
-    // 1. Get the perfectly smoothed rates of change (25ms buffer)
     accel_buffer.derive(dot_A[0], dot_A[1], dot_A[2]);
     mag_buffer.derive(dot_M[0], dot_M[1], dot_M[2]);
 
-    // 2. Pitch & Roll (Perpendicular to Gravity)
+    // 1. Tilt (Inverted correctly: -A x A_dot)
     float w_tilt[3];
     cross_product(current_A, dot_A, w_tilt);
+    
+    float raw_x = -w_tilt[0];
+    float raw_y = -w_tilt[1];
+    float raw_z = -w_tilt[2];
 
-    // 3. Define the Horizontal Reference Plane (East Vector)
+    // 2. Horizontal Reference Plane (East)
     float E[3];
     cross_product(current_A, current_M, E);
     float E_sq = dot_product(E, E);
 
-    float raw_x = w_tilt[0];
-    float raw_y = w_tilt[1];
-    float raw_z = w_tilt[2];
-
-    // If E_sq is tiny, you are pointing the phone at the Earth's core. (Impossible in normal gaming)
-    if (E_sq > 0.001f) {
-        // Find how much the magnetometer moved purely because of tilting
+    // 3. True Yaw extraction (Avoids division by zero if vectors are perfectly parallel)
+    if (E_sq > 0.000001f) {
         float w_tilt_x_M[3];
         cross_product(w_tilt, current_M, w_tilt_x_M);
         
-        // Subtract the tilt movement from the raw magnetometer movement
         float diff[3] = {
-            dot_M[0] - w_tilt_x_M[0],
-            dot_M[1] - w_tilt_x_M[1],
-            dot_M[2] - w_tilt_x_M[2]
+            w_tilt_x_M[0] - dot_M[0],
+            w_tilt_x_M[1] - dot_M[1],
+            w_tilt_x_M[2] - dot_M[2]
         };
         
-        // Isolate the exact Yaw rotation speed around the Gravity axis
         float yaw_scalar = dot_product(diff, E) / E_sq;
 
-        // Add the Horizontal Yaw precisely onto the Gravity axis
+        // Add pure Yaw rotation precisely onto the Gravity axis
         raw_x += yaw_scalar * current_A[0];
         raw_y += yaw_scalar * current_A[1];
         raw_z += yaw_scalar * current_A[2];
     }
 
-    // Apply sensitivity and output with tiny noise gate
     final_gyro[0] = (fabs(raw_x * SENSITIVITY) > STATIC_NOISE_GATE) ? raw_x * SENSITIVITY : 0.0f;
     final_gyro[1] = (fabs(raw_y * SENSITIVITY) > STATIC_NOISE_GATE) ? raw_y * SENSITIVITY : 0.0f;
     final_gyro[2] = (fabs(raw_z * SENSITIVITY) > STATIC_NOISE_GATE) ? raw_z * SENSITIVITY : 0.0f;
@@ -138,30 +131,30 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
         bool fusion_ready = false;
 
         for (ssize_t i = 0; i < actual_events; i++) {
-            float ts_sec = events[i].timestamp / 1000000000.0f;
-
+            
             if (events[i].type == ASENSOR_TYPE_ACCELEROMETER) {
                 current_A[0] = events[i].acceleration.x;
                 current_A[1] = events[i].acceleration.y;
                 current_A[2] = events[i].acceleration.z;
                 normalize(current_A);
-                accel_buffer.push(ts_sec, current_A[0], current_A[1], current_A[2]);
+                accel_buffer.push(events[i].timestamp, current_A[0], current_A[1], current_A[2]);
                 fusion_ready = true;
             } 
             else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || events[i].type == 14) {
-                current_M[0] = events[i].uncalibrated_magnetic.x_uncalib - HARD_IRON_X;
-                current_M[1] = events[i].uncalibrated_magnetic.y_uncalib - HARD_IRON_Y;
-                current_M[2] = events[i].uncalibrated_magnetic.z_uncalib - HARD_IRON_Z;
+                // Dynamically extract the OS's calibrated bias instead of hardcoding it!
+                current_M[0] = events[i].uncalibrated_magnetic.x_uncalib - events[i].uncalibrated_magnetic.x_bias;
+                current_M[1] = events[i].uncalibrated_magnetic.y_uncalib - events[i].uncalibrated_magnetic.y_bias;
+                current_M[2] = events[i].uncalibrated_magnetic.z_uncalib - events[i].uncalibrated_magnetic.z_bias;
                 normalize(current_M);
-                mag_buffer.push(ts_sec, current_M[0], current_M[1], current_M[2]);
+                mag_buffer.push(events[i].timestamp, current_M[0], current_M[1], current_M[2]);
                 fusion_ready = true;
             } 
-            else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD) {
+            else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD || events[i].type == 2) {
                 current_M[0] = events[i].magnetic.x;
                 current_M[1] = events[i].magnetic.y;
                 current_M[2] = events[i].magnetic.z;
                 normalize(current_M);
-                mag_buffer.push(ts_sec, current_M[0], current_M[1], current_M[2]);
+                mag_buffer.push(events[i].timestamp, current_M[0], current_M[1], current_M[2]);
                 fusion_ready = true;
             } 
             else if (events[i].type == ASENSOR_TYPE_GYROSCOPE || events[i].type == 4 || events[i].type == 16) {
