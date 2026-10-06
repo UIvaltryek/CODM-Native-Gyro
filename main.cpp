@@ -9,6 +9,12 @@
 static const float SENSITIVITY = 1.0f; 
 static const float STATIC_NOISE_GATE = 0.002f; 
 
+// --- FACTORY BIAS (MT6835 Hard-Iron Offsets) ---
+// Crucial for true uncalibrated magnetometer correction
+static const float HARD_IRON_X = 93.76f;
+static const float HARD_IRON_Y = -29.09f;
+static const float HARD_IRON_Z = 967.01f;
+
 // --- QUATERNION SLIDING WINDOW ---
 class RegressionBuffer {
 public:
@@ -108,7 +114,7 @@ void matrix_to_quat(float R[3][3], float q[4]) {
 }
 
 void compute_quaternion_kinematics(int64_t timestamp) {
-    // 1. Build the rigid 3D Grid (Rotation Matrix)
+    // 1. Build the rigid 3D Grid
     float H[3]; // East
     cross_product(current_M, current_A, H);
     normalize(H);
@@ -123,23 +129,22 @@ void compute_quaternion_kinematics(int64_t timestamp) {
         {current_A[0], current_A[1], current_A[2]}
     };
 
-    // 2. Convert to Quaternion (Immune to Gimbal Lock at 90 deg)
-    float q[4]; // w, x, y, z
+    // 2. Convert to Quaternion
+    float q[4]; 
     matrix_to_quat(R, q);
 
-    // 3. Double-Cover safety check (Prevents random math flips from causing gyro spikes)
+    // 3. Double-Cover safety check
     if ((q[0]*last_q[0] + q[1]*last_q[1] + q[2]*last_q[2] + q[3]*last_q[3]) < 0.0f) {
         q[0] = -q[0]; q[1] = -q[1]; q[2] = -q[2]; q[3] = -q[3];
     }
     memcpy(last_q, q, sizeof(q));
 
-    // 4. Push to 25ms regression buffer and extract the smooth slope
+    // 4. Push to 25ms regression buffer
     quat_buffer.push(timestamp, q[0], q[1], q[2], q[3]);
     float dw, dx, dy, dz;
     quat_buffer.derive(dw, dx, dy, dz);
 
     // 5. Aerospace extraction: w = 2 * (q_dot * q_inverse)
-    // This perfectly extracts the 3D angular velocity from the solid 3D grid!
     float raw_x = 2.0f * (-dw * q[1] + dx * q[0] - dy * q[3] + dz * q[2]);
     float raw_y = 2.0f * (-dw * q[2] + dx * q[3] + dy * q[0] - dz * q[1]);
     float raw_z = 2.0f * (-dw * q[3] - dx * q[2] + dy * q[1] + dz * q[0]);
@@ -170,9 +175,10 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                 fusion_ready = true;
             } 
             else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || events[i].type == 14) {
-                current_M[0] = events[i].uncalibrated_magnetic.x_uncalib;
-                current_M[1] = events[i].uncalibrated_magnetic.y_uncalib;
-                current_M[2] = events[i].uncalibrated_magnetic.z_uncalib;
+                // MANUAL BIAS SUBTRACTION RESTORED HERE
+                current_M[0] = events[i].uncalibrated_magnetic.x_uncalib - HARD_IRON_X;
+                current_M[1] = events[i].uncalibrated_magnetic.y_uncalib - HARD_IRON_Y;
+                current_M[2] = events[i].uncalibrated_magnetic.z_uncalib - HARD_IRON_Z;
                 normalize(current_M);
                 fusion_ready = true;
             } 
