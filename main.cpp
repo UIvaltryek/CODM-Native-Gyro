@@ -6,9 +6,8 @@
 #include "zygisk.hpp"
 
 // --- TUNABLE PARAMETERS ---
-static const float SENSITIVITY = 1.0f;
-static const float NOISE_GATE = 0.005f;      
-static const float BOOST_OFFSET = 0.13999f;  // Static deadzone spring (No dynamic fade)
+static const float SENSITIVITY = 1.0f; // Global multiplier (keep at 1.0f for true 1:1 hardware scaling)
+static const float STATIC_NOISE_GATE = 0.002f; // A microscopic gate purely to stop 200Hz magnetic micro-jitter when completely stationary
 
 // MT6835 Hard-Iron Biases
 static const float HARD_IRON_X = 93.76f;
@@ -29,7 +28,6 @@ public:
         if (count < 5) count++;
     }
 
-    // Calculates the Line of Best Fit to find the exact slope (Derivative)
     void derive(float& dx, float& dy, float& dz) {
         if (count < 2) { dx = 0; dy = 0; dz = 0; return; }
         
@@ -51,7 +49,6 @@ public:
             num_z += dt * (z[i] - mean_z);
         }
         
-        // Prevent division by zero if timestamps freeze
         if (den < 1e-6f) { dx = 0; dy = 0; dz = 0; return; } 
         
         dx = num_x / den; 
@@ -114,10 +111,10 @@ void compute_direct_kinematics() {
     float raw_y = (w_tilt[1] + w_yaw[1]) * SENSITIVITY;
     float raw_z = (w_tilt[2] + w_yaw[2]) * SENSITIVITY;
 
-    // 5. Apply the 100% static Deadzone Spring 
-    final_gyro[0] = apply_deadzone_spring(raw_x);
-    final_gyro[1] = apply_deadzone_spring(raw_y);
-    final_gyro[2] = apply_deadzone_spring(raw_z);
+    // 5. Apply pure, unadulterated velocity (with microscopic static noise gate to prevent table-wobble)
+    final_gyro[0] = (fabs(raw_x) > STATIC_NOISE_GATE) ? raw_x : 0.0f;
+    final_gyro[1] = (fabs(raw_y) > STATIC_NOISE_GATE) ? raw_y : 0.0f;
+    final_gyro[2] = (fabs(raw_z) > STATIC_NOISE_GATE) ? raw_z : 0.0f;
 }
 
 ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent* events, size_t count) {
