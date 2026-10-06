@@ -6,8 +6,8 @@
 #include "zygisk.hpp"
 
 // --- TUNABLE PARAMETERS ---
-static const float SENSITIVITY = 1.0f; // Global sensitivity multiplier
-static const float STATIC_NOISE_GATE = 0.002f; // Microscopic gate purely to kill stationary 200Hz magnetic vibration
+static const float SENSITIVITY = 1.0f; 
+static const float STATIC_NOISE_GATE = 0.002f; 
 
 // MT6835 Hard-Iron Biases
 static const float HARD_IRON_X = 93.76f;
@@ -15,7 +15,6 @@ static const float HARD_IRON_Y = -29.09f;
 static const float HARD_IRON_Z = 967.01f;
 
 // --- 5-FRAME SLIDING WINDOW (LINEAR REGRESSION) ---
-// Smooths out sensor steps without creating "ice-sliding" phase lag
 class RegressionBuffer {
 public:
     float t[5] = {0};
@@ -81,30 +80,56 @@ void cross_product(float a[3], float b[3], float out[3]) {
     out[2] = a[0]*b[1] - a[1]*b[0];
 }
 
-void compute_additive_kinematics() {
+float dot_product(float a[3], float b[3]) {
+    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+}
+
+void compute_true_kinematics() {
     float dot_A[3], dot_M[3];
     
-    // 1. Get the perfectly smoothed rates of change from the 25ms regression buffers
+    // 1. Get the perfectly smoothed rates of change (25ms buffer)
     accel_buffer.derive(dot_A[0], dot_A[1], dot_A[2]);
     mag_buffer.derive(dot_M[0], dot_M[1], dot_M[2]);
 
-    // 2. The Accelerometer Spin (Dominates Pitch/Roll, drops Yaw at 90 deg)
-    float w_acc[3];
-    cross_product(current_A, dot_A, w_acc);
+    // 2. Pitch & Roll (Perpendicular to Gravity)
+    float w_tilt[3];
+    cross_product(current_A, dot_A, w_tilt);
 
-    // 3. The Magnetometer Spin (Dominates Yaw, drops Pitch/Roll)
-    float w_mag[3];
-    cross_product(current_M, dot_M, w_mag);
-    
-    // 4. Your Masterpiece: Pure Additive Synthesis
-    float raw_x = (w_acc[0] + w_mag[0]) * SENSITIVITY;
-    float raw_y = (w_acc[1] + w_mag[1]) * SENSITIVITY;
-    float raw_z = (w_acc[2] + w_mag[2]) * SENSITIVITY;
+    // 3. Define the Horizontal Reference Plane (East Vector)
+    float E[3];
+    cross_product(current_A, current_M, E);
+    float E_sq = dot_product(E, E);
 
-    // 5. Apply the raw data with a tiny noise gate to kill table-wobble
-    final_gyro[0] = (fabs(raw_x) > STATIC_NOISE_GATE) ? raw_x : 0.0f;
-    final_gyro[1] = (fabs(raw_y) > STATIC_NOISE_GATE) ? raw_y : 0.0f;
-    final_gyro[2] = (fabs(raw_z) > STATIC_NOISE_GATE) ? raw_z : 0.0f;
+    float raw_x = w_tilt[0];
+    float raw_y = w_tilt[1];
+    float raw_z = w_tilt[2];
+
+    // If E_sq is tiny, you are pointing the phone at the Earth's core. (Impossible in normal gaming)
+    if (E_sq > 0.001f) {
+        // Find how much the magnetometer moved purely because of tilting
+        float w_tilt_x_M[3];
+        cross_product(w_tilt, current_M, w_tilt_x_M);
+        
+        // Subtract the tilt movement from the raw magnetometer movement
+        float diff[3] = {
+            dot_M[0] - w_tilt_x_M[0],
+            dot_M[1] - w_tilt_x_M[1],
+            dot_M[2] - w_tilt_x_M[2]
+        };
+        
+        // Isolate the exact Yaw rotation speed around the Gravity axis
+        float yaw_scalar = dot_product(diff, E) / E_sq;
+
+        // Add the Horizontal Yaw precisely onto the Gravity axis
+        raw_x += yaw_scalar * current_A[0];
+        raw_y += yaw_scalar * current_A[1];
+        raw_z += yaw_scalar * current_A[2];
+    }
+
+    // Apply sensitivity and output with tiny noise gate
+    final_gyro[0] = (fabs(raw_x * SENSITIVITY) > STATIC_NOISE_GATE) ? raw_x * SENSITIVITY : 0.0f;
+    final_gyro[1] = (fabs(raw_y * SENSITIVITY) > STATIC_NOISE_GATE) ? raw_y * SENSITIVITY : 0.0f;
+    final_gyro[2] = (fabs(raw_z * SENSITIVITY) > STATIC_NOISE_GATE) ? raw_z * SENSITIVITY : 0.0f;
 }
 
 ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent* events, size_t count) {
@@ -139,7 +164,6 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                 mag_buffer.push(ts_sec, current_M[0], current_M[1], current_M[2]);
                 fusion_ready = true;
             } 
-            // Feed the raw additive angular velocity directly to the game
             else if (events[i].type == ASENSOR_TYPE_GYROSCOPE || events[i].type == 4 || events[i].type == 16) {
                 events[i].vector.x = final_gyro[0]; 
                 events[i].vector.y = final_gyro[1]; 
@@ -148,7 +172,7 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
         }
 
         if (fusion_ready) {
-            compute_additive_kinematics();
+            compute_true_kinematics();
         }
     }
     return actual_events;
