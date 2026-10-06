@@ -7,10 +7,10 @@
 
 // --- TUNABLE PARAMETERS ---
 static const float SENSITIVITY = 1.0f; 
-static const float STATIC_NOISE_GATE = 0.002f; 
+static const float STATIC_NOISE_GATE = 0.002f; // Kills 200Hz magnetic jitter when stationary
 
 // --- 5-FRAME SLIDING WINDOW (LINEAR REGRESSION) ---
-// Upgraded to Double-Precision relative time to prevent Float Truncation on high uptimes
+// Double-precision time prevents math breakdown when phone uptime is high
 class RegressionBuffer {
 public:
     int64_t t[5] = {0};
@@ -28,7 +28,7 @@ public:
         if (count < 2) { dx = dy = dz = 0.0f; return; }
         
         double sum_t = 0, sum_x = 0, sum_y = 0, sum_z = 0;
-        int64_t t0 = t[0]; // Normalize time to prevent float overflow
+        int64_t t0 = t[0]; // Anchor time to prevent float truncation
         for (int i = 0; i < count; i++) {
             double dt = (t[i] - t0) / 1000000000.0;
             sum_t += dt; sum_x += x[i]; sum_y += y[i]; sum_z += z[i];
@@ -78,51 +78,30 @@ void cross_product(float a[3], float b[3], float out[3]) {
     out[2] = a[0]*b[1] - a[1]*b[0];
 }
 
-float dot_product(float a[3], float b[3]) {
-    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
-}
-
-void compute_true_kinematics() {
+void compute_additive_kinematics() {
     float dot_A[3], dot_M[3];
     
+    // 1. Get the perfectly smoothed rates of change
     accel_buffer.derive(dot_A[0], dot_A[1], dot_A[2]);
     mag_buffer.derive(dot_M[0], dot_M[1], dot_M[2]);
 
-    // 1. Tilt (Inverted correctly: -A x A_dot)
-    float w_tilt[3];
-    cross_product(current_A, dot_A, w_tilt);
-    
-    float raw_x = -w_tilt[0];
-    float raw_y = -w_tilt[1];
-    float raw_z = -w_tilt[2];
+    // 2. Accelerometer Spin (A x A_dot)
+    float w_acc[3];
+    cross_product(current_A, dot_A, w_acc);
 
-    // 2. Horizontal Reference Plane (East)
-    float E[3];
-    cross_product(current_A, current_M, E);
-    float E_sq = dot_product(E, E);
+    // 3. Magnetometer Spin (M x M_dot)
+    float w_mag[3];
+    cross_product(current_M, dot_M, w_mag);
 
-    // 3. True Yaw extraction (Avoids division by zero if vectors are perfectly parallel)
-    if (E_sq > 0.000001f) {
-        float w_tilt_x_M[3];
-        cross_product(w_tilt, current_M, w_tilt_x_M);
-        
-        float diff[3] = {
-            w_tilt_x_M[0] - dot_M[0],
-            w_tilt_x_M[1] - dot_M[1],
-            w_tilt_x_M[2] - dot_M[2]
-        };
-        
-        float yaw_scalar = dot_product(diff, E) / E_sq;
+    // 4. Your Masterpiece: Pure Additive Synthesis
+    float raw_x = (w_acc[0] + w_mag[0]) * SENSITIVITY;
+    float raw_y = (w_acc[1] + w_mag[1]) * SENSITIVITY;
+    float raw_z = (w_acc[2] + w_mag[2]) * SENSITIVITY;
 
-        // Add pure Yaw rotation precisely onto the Gravity axis
-        raw_x += yaw_scalar * current_A[0];
-        raw_y += yaw_scalar * current_A[1];
-        raw_z += yaw_scalar * current_A[2];
-    }
-
-    final_gyro[0] = (fabs(raw_x * SENSITIVITY) > STATIC_NOISE_GATE) ? raw_x * SENSITIVITY : 0.0f;
-    final_gyro[1] = (fabs(raw_y * SENSITIVITY) > STATIC_NOISE_GATE) ? raw_y * SENSITIVITY : 0.0f;
-    final_gyro[2] = (fabs(raw_z * SENSITIVITY) > STATIC_NOISE_GATE) ? raw_z * SENSITIVITY : 0.0f;
+    // 5. Output with noise gate
+    final_gyro[0] = (fabs(raw_x) > STATIC_NOISE_GATE) ? raw_x : 0.0f;
+    final_gyro[1] = (fabs(raw_y) > STATIC_NOISE_GATE) ? raw_y : 0.0f;
+    final_gyro[2] = (fabs(raw_z) > STATIC_NOISE_GATE) ? raw_z : 0.0f;
 }
 
 ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent* events, size_t count) {
@@ -141,10 +120,10 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                 fusion_ready = true;
             } 
             else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || events[i].type == 14) {
-                // Dynamically extract the OS's calibrated bias instead of hardcoding it!
-                current_M[0] = events[i].uncalibrated_magnetic.x_uncalib - events[i].uncalibrated_magnetic.x_bias;
-                current_M[1] = events[i].uncalibrated_magnetic.y_uncalib - events[i].uncalibrated_magnetic.y_bias;
-                current_M[2] = events[i].uncalibrated_magnetic.z_uncalib - events[i].uncalibrated_magnetic.z_bias;
+                // Strictly pure raw uncalibrated data as requested. No bias subtraction.
+                current_M[0] = events[i].uncalibrated_magnetic.x_uncalib;
+                current_M[1] = events[i].uncalibrated_magnetic.y_uncalib;
+                current_M[2] = events[i].uncalibrated_magnetic.z_uncalib;
                 normalize(current_M);
                 mag_buffer.push(events[i].timestamp, current_M[0], current_M[1], current_M[2]);
                 fusion_ready = true;
@@ -165,7 +144,7 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
         }
 
         if (fusion_ready) {
-            compute_true_kinematics();
+            compute_additive_kinematics();
         }
     }
     return actual_events;
