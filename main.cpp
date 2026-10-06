@@ -5,129 +5,100 @@
 #include "dobby.h"
 #include "zygisk.hpp"
 
-// --- TUNABLE PARAMETERS ---
-static const float SENSITIVITY = 1.0f;
-static const float LOW_PASS_ALPHA = 0.4f; // Step 4: Filter the Result (Lower = smoother, Higher = more responsive)
-static const float STATIC_NOISE_GATE = 0.002f;
+// Production Build: All logging and filters removed for raw 1:1 input
+static const float MAG_NOISE_GATE = 0.015f; 
 
 // --- FACTORY BIASES (MT6835 Hard-Iron Offsets) ---
 static const float HARD_IRON_X = 93.76f;
 static const float HARD_IRON_Y = -29.09f;
 static const float HARD_IRON_Z = 967.01f;
 
-static float current_A[3] = {0.0f, 0.0f, 1.0f};
-static float current_M[3] = {0.0f, 1.0f, 0.0f};
+static float final_gyro[3] = {0.0f, 0.0f, 0.0f}; 
 
-// History state for Step 2 and Step 4
-static int64_t last_timestamp = 0;
-static float last_q[4] = {1.0f, 0.0f, 0.0f, 0.0f};
-static float filtered_gyro[3] = {0.0f, 0.0f, 0.0f};
+// Sensor States
+static float last_accel[3] = {0.0f, 0.0f, 9.81f}; 
+static float last_mag[3] = {0.0f, 1.0f, 0.0f}; 
+static int64_t last_timestamp = 0; 
 
-typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
-static getEvents_t orig_getEvents = nullptr;
+static float last_pitch = 0.0f; 
+static float last_roll = 0.0f; 
+static float last_hx = 0.0f; 
+static float last_hy = 1.0f; 
+static float last_hz = 0.0f; 
+
+typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t); 
+static getEvents_t orig_getEvents = nullptr; 
 typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
 static setEventRate_t orig_setEventRate = nullptr;
 
-void normalize(float v[3]) {
-    float norm = sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
-    if (norm > 0.0001f) { v[0] /= norm; v[1] /= norm; v[2] /= norm; }
-}
+void compute_sensor_fusion(int64_t timestamp) {
+    float ax = last_accel[0]; float ay = last_accel[1]; float az = last_accel[2]; 
+    float mx = last_mag[0]; float my = last_mag[1]; float mz = last_mag[2]; 
 
-void cross_product(float a[3], float b[3], float out[3]) {
-    out[0] = a[1]*b[2] - a[2]*b[1];
-    out[1] = a[2]*b[0] - a[0]*b[2];
-    out[2] = a[0]*b[1] - a[1]*b[0];
-}
+    float G = sqrt(ax*ax + ay*ay + az*az); 
+    if (G < 0.1f) G = 0.1f; 
 
-void matrix_to_quat(float R[3][3], float q[4]) {
-    float tr = R[0][0] + R[1][1] + R[2][2];
-    if (tr > 0.0f) { 
-        float S = sqrt(tr + 1.0f) * 2.0f; 
-        q[0] = 0.25f * S; 
-        q[1] = (R[1][2] - R[2][1]) / S; 
-        q[2] = (R[2][0] - R[0][2]) / S; 
-        q[3] = (R[0][1] - R[1][0]) / S; 
-    } else if ((R[0][0] > R[1][1]) && (R[0][0] > R[2][2])) { 
-        float S = sqrt(1.0f + R[0][0] - R[1][1] - R[2][2]) * 2.0f; 
-        q[0] = (R[1][2] - R[2][1]) / S; 
-        q[1] = 0.25f * S; 
-        q[2] = (R[0][1] + R[1][0]) / S; 
-        q[3] = (R[2][0] + R[0][2]) / S; 
-    } else if (R[1][1] > R[2][2]) { 
-        float S = sqrt(1.0f + R[1][1] - R[0][0] - R[2][2]) * 2.0f; 
-        q[0] = (R[2][0] - R[0][2]) / S; 
-        q[1] = (R[0][1] + R[1][0]) / S; 
-        q[2] = 0.25f * S; 
-        q[3] = (R[1][2] + R[2][1]) / S; 
-    } else { 
-        float S = sqrt(1.0f + R[2][2] - R[0][0] - R[1][1]) * 2.0f; 
-        q[0] = (R[0][1] - R[1][0]) / S; 
-        q[1] = (R[2][0] + R[0][2]) / S; 
-        q[2] = (R[1][2] + R[2][1]) / S; 
-        q[3] = 0.25f * S; 
-    }
-    float norm = sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
-    if (norm > 0.0001f) { q[0]/=norm; q[1]/=norm; q[2]/=norm; q[3]/=norm; }
-}
+    float gx = ax / G; float gy = ay / G; float gz = az / G; 
 
-void compute_nxp_kinematics(int64_t current_timestamp) {
-    if (last_timestamp == 0) {
-        last_timestamp = current_timestamp;
-        return;
+    float pitch = atan2(ay, az); 
+
+    float normalized_ax = -ax / G; 
+    if (normalized_ax > 1.0f) normalized_ax = 1.0f; 
+    if (normalized_ax < -1.0f) normalized_ax = -1.0f; 
+    float roll = asin(normalized_ax); 
+
+    float dot_mg = mx * gx + my * gy + mz * gz; 
+    float hx = mx - dot_mg * gx; 
+    float hy = my - dot_mg * gy; 
+    float hz = mz - dot_mg * gz; 
+
+    float H = sqrt(hx*hx + hy*hy + hz*hz); 
+    if (H < 0.01f) H = 0.01f; 
+    hx /= H; hy /= H; hz /= H; 
+
+    if (last_timestamp == 0) { 
+        last_timestamp = timestamp; 
+        last_pitch = pitch; last_roll = roll; 
+        last_hx = hx; last_hy = hy; last_hz = hz; 
+        return; 
     }
 
-    // Step 3: Divide by Time (Calculate delta t)
-    float dt = (current_timestamp - last_timestamp) / 1000000000.0f;
-    last_timestamp = current_timestamp;
-    if (dt <= 0.0f || dt > 0.1f) return; // Ignore frozen or massive time leaps
+    float raw_dt = (timestamp - last_timestamp) / 1000000000.0f; 
+    if (raw_dt <= 0.0f || raw_dt > 0.1f) { 
+        last_timestamp = timestamp; 
+        return; 
+    }
 
-    // Step 1: Compute Orientation q(t)
-    float H[3]; cross_product(current_M, current_A, H); normalize(H);
-    float N[3]; cross_product(current_A, H, N); normalize(N);
+    float speed_pitch = (pitch - last_pitch) / raw_dt; 
+    float speed_roll = (roll - last_roll) / raw_dt; 
+
+    float dot_h = hx * last_hx + hy * last_hy + hz * last_hz; 
+    if (dot_h > 1.0f) dot_h = 1.0f; 
+    if (dot_h < -1.0f) dot_h = -1.0f; 
+    float mag_delta_yaw = acos(dot_h); 
+
+    float cx = last_hy * hz - last_hz * hy; 
+    float cy = last_hz * hx - last_hx * hz; 
+    float cz = last_hx * hy - last_hy * hx; 
     
-    float R[3][3] = {
-        {H[0], H[1], H[2]},
-        {N[0], N[1], N[2]},
-        {current_A[0], current_A[1], current_A[2]}
-    };
+    float direction = cx * gx + cy * gy + cz * gz; 
+    if (direction < 0.0f) mag_delta_yaw = -mag_delta_yaw; 
 
-    float q_curr[4]; 
-    matrix_to_quat(R, q_curr);
+    float speed_yaw = mag_delta_yaw / raw_dt; 
+    if (fabs(speed_yaw) < MAG_NOISE_GATE) speed_yaw = 0.0f; 
 
-    // Step 2: Calculate Difference (Relative rotation: q_diff = q_curr * q_prev_inverse)
-    float q_prev_inv[4] = {last_q[0], -last_q[1], -last_q[2], -last_q[3]};
-    float r[4];
-    r[0] = q_curr[0]*q_prev_inv[0] - q_curr[1]*q_prev_inv[1] - q_curr[2]*q_prev_inv[2] - q_curr[3]*q_prev_inv[3];
-    r[1] = q_curr[0]*q_prev_inv[1] + q_curr[1]*q_prev_inv[0] + q_curr[2]*q_prev_inv[3] - q_curr[3]*q_prev_inv[2];
-    r[2] = q_curr[0]*q_prev_inv[2] - q_curr[1]*q_prev_inv[3] + q_curr[2]*q_prev_inv[0] + q_curr[3]*q_prev_inv[1];
-    r[3] = q_curr[0]*q_prev_inv[3] + q_curr[1]*q_prev_inv[2] - q_curr[2]*q_prev_inv[1] + q_curr[3]*q_prev_inv[0];
-
-    // Enforce shortest path rotation to prevent mathematical flipping
-    if (r[0] < 0.0f) {
-        r[0] = -r[0]; r[1] = -r[1]; r[2] = -r[2]; r[3] = -r[3];
-    }
-    memcpy(last_q, q_curr, sizeof(q_curr));
-
-    // Extract the raw angular velocity (Radians per second)
-    float angle = 2.0f * acos(fmin(1.0f, r[0]));
-    float s = sqrt(1.0f - r[0]*r[0]);
+    float fade_factor = pow(fabs(sin(pitch)), 4.0f); 
     
-    float raw_x = 0.0f, raw_y = 0.0f, raw_z = 0.0f;
-    if (s > 0.001f) {
-        raw_x = (r[1] / s) * (angle / dt) * SENSITIVITY;
-        raw_y = (r[2] / s) * (angle / dt) * SENSITIVITY;
-        raw_z = (r[3] / s) * (angle / dt) * SENSITIVITY;
-    }
+    float final_horizontal_speed = (speed_roll * (1.0f - fade_factor)) + (speed_yaw * fade_factor); 
 
-    // Step 4: Filter the Result (Low-Pass Filter to minimize numerical differentiation noise)
-    filtered_gyro[0] = (LOW_PASS_ALPHA * raw_x) + ((1.0f - LOW_PASS_ALPHA) * filtered_gyro[0]);
-    filtered_gyro[1] = (LOW_PASS_ALPHA * raw_y) + ((1.0f - LOW_PASS_ALPHA) * filtered_gyro[1]);
-    filtered_gyro[2] = (LOW_PASS_ALPHA * raw_z) + ((1.0f - LOW_PASS_ALPHA) * filtered_gyro[2]);
+    // DIRECT FEED (No ALPHA_ACCEL Low-Pass Filter)
+    final_gyro[0] = speed_pitch; 
+    final_gyro[1] = final_horizontal_speed; 
+    final_gyro[2] = 0.0f; 
 
-    // Apply strict hardware noise gate
-    if (fabs(filtered_gyro[0]) < STATIC_NOISE_GATE) filtered_gyro[0] = 0.0f;
-    if (fabs(filtered_gyro[1]) < STATIC_NOISE_GATE) filtered_gyro[1] = 0.0f;
-    if (fabs(filtered_gyro[2]) < STATIC_NOISE_GATE) filtered_gyro[2] = 0.0f;
+    last_pitch = pitch; last_roll = roll; 
+    last_hx = hx; last_hy = hy; last_hz = hz; 
+    last_timestamp = timestamp; 
 }
 
 ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent* events, size_t count) {
@@ -140,28 +111,27 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
             latest_ts = events[i].timestamp;
             
             if (events[i].type == ASENSOR_TYPE_ACCELEROMETER) {
-                current_A[0] = events[i].acceleration.x;
-                current_A[1] = events[i].acceleration.y;
-                current_A[2] = events[i].acceleration.z;
-                normalize(current_A);
+                last_accel[0] = events[i].acceleration.x;
+                last_accel[1] = events[i].acceleration.y;
+                last_accel[2] = events[i].acceleration.z;
                 fusion_ready = true;
             } 
+            // STRICTLY UNCALIBRATED MAGNETOMETER WITH HARD-IRON OFFSETS
             else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || events[i].type == 14) {
-                current_M[0] = events[i].uncalibrated_magnetic.x_uncalib - HARD_IRON_X;
-                current_M[1] = events[i].uncalibrated_magnetic.y_uncalib - HARD_IRON_Y;
-                current_M[2] = events[i].uncalibrated_magnetic.z_uncalib - HARD_IRON_Z;
-                normalize(current_M);
+                last_mag[0] = events[i].uncalibrated_magnetic.x_uncalib - HARD_IRON_X;
+                last_mag[1] = events[i].uncalibrated_magnetic.y_uncalib - HARD_IRON_Y;
+                last_mag[2] = events[i].uncalibrated_magnetic.z_uncalib - HARD_IRON_Z;
                 fusion_ready = true;
-            } 
+            }
             else if (events[i].type == ASENSOR_TYPE_GYROSCOPE || events[i].type == 4 || events[i].type == 16) {
-                events[i].vector.x = filtered_gyro[0]; 
-                events[i].vector.y = filtered_gyro[1]; 
-                events[i].vector.z = filtered_gyro[2]; 
+                events[i].vector.x = final_gyro[0]; 
+                events[i].vector.y = final_gyro[1]; 
+                events[i].vector.z = final_gyro[2]; 
             }
         }
 
         if (fusion_ready && latest_ts > 0) {
-            compute_nxp_kinematics(latest_ts);
+            compute_sensor_fusion(latest_ts);
         }
     }
     return actual_events;
