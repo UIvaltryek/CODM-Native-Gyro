@@ -6,8 +6,8 @@
 #include "zygisk.hpp"
 
 // --- TUNABLE PARAMETERS ---
-static const float SENSITIVITY = 1.0f; // Global multiplier (keep at 1.0f for true 1:1 hardware scaling)
-static const float STATIC_NOISE_GATE = 0.002f; // A microscopic gate purely to stop 200Hz magnetic micro-jitter when completely stationary
+static const float SENSITIVITY = 1.0f; // Global sensitivity multiplier
+static const float STATIC_NOISE_GATE = 0.002f; // Microscopic gate purely to kill stationary 200Hz magnetic vibration
 
 // MT6835 Hard-Iron Biases
 static const float HARD_IRON_X = 93.76f;
@@ -15,6 +15,7 @@ static const float HARD_IRON_Y = -29.09f;
 static const float HARD_IRON_Z = 967.01f;
 
 // --- 5-FRAME SLIDING WINDOW (LINEAR REGRESSION) ---
+// Smooths out sensor steps without creating "ice-sliding" phase lag
 class RegressionBuffer {
 public:
     float t[5] = {0};
@@ -80,38 +81,27 @@ void cross_product(float a[3], float b[3], float out[3]) {
     out[2] = a[0]*b[1] - a[1]*b[0];
 }
 
-float dot_product(float a[3], float b[3]) {
-    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
-}
-
-void compute_direct_kinematics() {
+void compute_additive_kinematics() {
     float dot_A[3], dot_M[3];
     
-    // 1. Get smoothly derived vectors from the 25ms regression buffers
+    // 1. Get the perfectly smoothed rates of change from the 25ms regression buffers
     accel_buffer.derive(dot_A[0], dot_A[1], dot_A[2]);
     mag_buffer.derive(dot_M[0], dot_M[1], dot_M[2]);
 
-    // 2. TILT (Pitch/Roll): A x A_dot
-    float w_tilt[3];
-    cross_product(current_A, dot_A, w_tilt);
+    // 2. The Accelerometer Spin (Dominates Pitch/Roll, drops Yaw at 90 deg)
+    float w_acc[3];
+    cross_product(current_A, dot_A, w_acc);
 
-    // 3. YAW (Magnetic projection): ((M x M_dot) • A) * A
-    float m_spin[3];
-    cross_product(current_M, dot_M, m_spin);
+    // 3. The Magnetometer Spin (Dominates Yaw, drops Pitch/Roll)
+    float w_mag[3];
+    cross_product(current_M, dot_M, w_mag);
     
-    float yaw_scalar = dot_product(m_spin, current_A);
-    float w_yaw[3] = {
-        yaw_scalar * current_A[0],
-        yaw_scalar * current_A[1],
-        yaw_scalar * current_A[2]
-    };
+    // 4. Your Masterpiece: Pure Additive Synthesis
+    float raw_x = (w_acc[0] + w_mag[0]) * SENSITIVITY;
+    float raw_y = (w_acc[1] + w_mag[1]) * SENSITIVITY;
+    float raw_z = (w_acc[2] + w_mag[2]) * SENSITIVITY;
 
-    // 4. Combine completely decoupled axes
-    float raw_x = (w_tilt[0] + w_yaw[0]) * SENSITIVITY;
-    float raw_y = (w_tilt[1] + w_yaw[1]) * SENSITIVITY;
-    float raw_z = (w_tilt[2] + w_yaw[2]) * SENSITIVITY;
-
-    // 5. Apply pure, unadulterated velocity (with microscopic static noise gate to prevent table-wobble)
+    // 5. Apply the raw data with a tiny noise gate to kill table-wobble
     final_gyro[0] = (fabs(raw_x) > STATIC_NOISE_GATE) ? raw_x : 0.0f;
     final_gyro[1] = (fabs(raw_y) > STATIC_NOISE_GATE) ? raw_y : 0.0f;
     final_gyro[2] = (fabs(raw_z) > STATIC_NOISE_GATE) ? raw_z : 0.0f;
@@ -149,6 +139,7 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                 mag_buffer.push(ts_sec, current_M[0], current_M[1], current_M[2]);
                 fusion_ready = true;
             } 
+            // Feed the raw additive angular velocity directly to the game
             else if (events[i].type == ASENSOR_TYPE_GYROSCOPE || events[i].type == 4 || events[i].type == 16) {
                 events[i].vector.x = final_gyro[0]; 
                 events[i].vector.y = final_gyro[1]; 
@@ -157,7 +148,7 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
         }
 
         if (fusion_ready) {
-            compute_direct_kinematics();
+            compute_additive_kinematics();
         }
     }
     return actual_events;
