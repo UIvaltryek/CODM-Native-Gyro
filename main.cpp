@@ -5,8 +5,8 @@
 #include "dobby.h"
 #include "zygisk.hpp"
 
-// --- TUNABLE PARAMETERS ---
-static const float ALPHA_SMOOTH = 0.65f; // Cures the raw derivative wobble
+// Production Build: Your exact original architecture restored
+static const float ALPHA_ACCEL = 0.65f; 
 static const float MAG_NOISE_GATE = 0.015f; 
 
 // --- FACTORY BIASES (MT6835 Hard-Iron Offsets) ---
@@ -17,34 +17,51 @@ static const float HARD_IRON_Z = 967.01f;
 static float smoothed_gyro[3] = {0.0f, 0.0f, 0.0f}; 
 
 // Sensor States
-static float last_A[3] = {0.0f, 0.0f, 1.0f}; 
-static float last_M[3] = {0.0f, 1.0f, 0.0f}; 
-static float last_H[3] = {0.0f, 1.0f, 0.0f}; 
+static float last_accel[3] = {0.0f, 0.0f, 9.81f}; 
+static float last_mag[3] = {0.0f, 1.0f, 0.0f}; 
 static int64_t last_timestamp = 0; 
+
+static float last_pitch = 0.0f; 
+static float last_roll = 0.0f; 
+static float last_hx = 0.0f; 
+static float last_hy = 1.0f; 
+static float last_hz = 0.0f; 
 
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t); 
 static getEvents_t orig_getEvents = nullptr; 
 typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
 static setEventRate_t orig_setEventRate = nullptr;
 
-void normalize(float v[3]) {
-    float norm = sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
-    if (norm > 0.0001f) { v[0] /= norm; v[1] /= norm; v[2] /= norm; }
-}
+void compute_sensor_fusion(int64_t timestamp) {
+    float ax = last_accel[0]; float ay = last_accel[1]; float az = last_accel[2]; 
+    float mx = last_mag[0]; float my = last_mag[1]; float mz = last_mag[2]; 
 
-void cross_product(float a[3], float b[3], float out[3]) {
-    out[0] = a[1]*b[2] - a[2]*b[1];
-    out[1] = a[2]*b[0] - a[0]*b[2];
-    out[2] = a[0]*b[1] - a[1]*b[0];
-}
+    // Gravity Normalization
+    float G = sqrt(ax*ax + ay*ay + az*az); 
+    if (G < 0.1f) G = 0.1f; 
+    float gx = ax / G; float gy = ay / G; float gz = az / G; 
 
-float dot_product(float a[3], float b[3]) {
-    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
-}
+    // Original Pitch and Roll Extraction
+    float pitch = atan2(ay, az); 
+    float normalized_ax = -ax / G; 
+    if (normalized_ax > 1.0f) normalized_ax = 1.0f; 
+    if (normalized_ax < -1.0f) normalized_ax = -1.0f; 
+    float roll = asin(normalized_ax); 
 
-void compute_vector_kinematics(int64_t timestamp) {
+    // Original Horizontal Magnetic Projection
+    float dot_mg = mx * gx + my * gy + mz * gz; 
+    float hx = mx - dot_mg * gx; 
+    float hy = my - dot_mg * gy; 
+    float hz = mz - dot_mg * gz; 
+
+    float H = sqrt(hx*hx + hy*hy + hz*hz); 
+    if (H < 0.01f) H = 0.01f; 
+    hx /= H; hy /= H; hz /= H; 
+
     if (last_timestamp == 0) { 
         last_timestamp = timestamp; 
+        last_pitch = pitch; last_roll = roll; 
+        last_hx = hx; last_hy = hy; last_hz = hz; 
         return; 
     }
 
@@ -54,75 +71,46 @@ void compute_vector_kinematics(int64_t timestamp) {
         return; 
     }
 
-    // 1. Current Gravity (A) and Magnetic (M) Vectors
-    float A[3] = {last_A[0], last_A[1], last_A[2]};
-    float M[3] = {last_M[0], last_M[1], last_M[2]};
+    // --- SNAP FIX 1: Boundary Wrapping for Pitch/Roll ---
+    float delta_pitch = pitch - last_pitch;
+    while (delta_pitch > M_PI) delta_pitch -= 2.0f * M_PI;
+    while (delta_pitch < -M_PI) delta_pitch += 2.0f * M_PI;
+    float speed_pitch = delta_pitch / raw_dt; 
 
-    // 2. Extract the true horizontal Magnetic vector (H), perfectly perpendicular to Gravity
-    float M_dot_A = dot_product(M, A);
-    float H[3] = {
-        M[0] - M_dot_A * A[0],
-        M[1] - M_dot_A * A[1],
-        M[2] - M_dot_A * A[2]
-    };
+    float delta_roll = roll - last_roll;
+    while (delta_roll > M_PI) delta_roll -= 2.0f * M_PI;
+    while (delta_roll < -M_PI) delta_roll += 2.0f * M_PI;
+    float speed_roll = delta_roll / raw_dt; 
+
+    // --- SNAP FIX 2: Cross Product Asin for Yaw ---
+    float cx = last_hy * hz - last_hz * hy; 
+    float cy = last_hz * hx - last_hx * hz; 
+    float cz = last_hx * hy - last_hy * hx; 
     
-    // Prevent division by zero if vectors perfectly align
-    float H_norm = sqrt(H[0]*H[0] + H[1]*H[1] + H[2]*H[2]);
-    if (H_norm > 0.001f) {
-        H[0] /= H_norm; H[1] /= H_norm; H[2] /= H_norm;
-    } else {
-        H[0] = last_H[0]; H[1] = last_H[1]; H[2] = last_H[2];
-    }
-
-    // ====================================================================
-    // PART 1: TILT VELOCITY (Pitch/Roll)
-    // Formula: dA x A
-    // Flawlessly calculates vertical aiming without using atan2 (ZERO 180 SNAPS)
-    // ====================================================================
-    float dA[3] = {
-        (A[0] - last_A[0]) / raw_dt,
-        (A[1] - last_A[1]) / raw_dt,
-        (A[2] - last_A[2]) / raw_dt
-    };
-    float w_tilt[3];
-    cross_product(dA, A, w_tilt);
-
-    // ====================================================================
-    // PART 2: YAW VELOCITY (Horizontal Panning)
-    // Measures how fast H rotates strictly around the A axis
-    // ====================================================================
-    float C[3];
-    cross_product(last_H, H, C);
+    // This perfectly extracts the signed rotation magnitude around the Gravity vector.
+    // If hx,hy,hz teleports 180 degrees, this naturally outputs 0 instead of a massive spike.
+    float sin_yaw = cx * gx + cy * gy + cz * gz; 
+    if (sin_yaw > 1.0f) sin_yaw = 1.0f;
+    if (sin_yaw < -1.0f) sin_yaw = -1.0f;
     
-    // The dot product with Gravity gives the exact radians swept.
-    // Negative sign correctly aligns the rotation with right-hand rule kinematics.
-    float yaw_delta = -dot_product(C, A); 
-    float w_yaw_scalar = yaw_delta / raw_dt;
+    float mag_delta_yaw = asin(sin_yaw); 
+    float speed_yaw = mag_delta_yaw / raw_dt; 
     
-    if (fabs(w_yaw_scalar) < MAG_NOISE_GATE) w_yaw_scalar = 0.0f;
-    
-    // Project the horizontal speed perfectly onto the Gravity axis
-    float w_yaw[3] = {
-        w_yaw_scalar * A[0],
-        w_yaw_scalar * A[1],
-        w_yaw_scalar * A[2]
-    };
+    if (fabs(speed_yaw) < MAG_NOISE_GATE) speed_yaw = 0.0f; 
 
-    // ====================================================================
-    // PART 3: MASTER SYNTHESIS & ANTI-WOBBLE FILTER
-    // ====================================================================
-    float raw_x = w_tilt[0] + w_yaw[0];
-    float raw_y = w_tilt[1] + w_yaw[1];
-    float raw_z = w_tilt[2] + w_yaw[2];
+    // --- YOUR EXACT ORIGINAL FADE FACTOR AND SYNTHESIS ---
+    float fade_factor = pow(fabs(sin(pitch)), 4.0f); 
+    float final_horizontal_speed = (speed_roll * (1.0f - fade_factor)) + (speed_yaw * fade_factor); 
 
-    // Your 0.65f filter to surgically kill the derivative wobble
-    smoothed_gyro[0] = (ALPHA_SMOOTH * raw_x) + ((1.0f - ALPHA_SMOOTH) * smoothed_gyro[0]);
-    smoothed_gyro[1] = (ALPHA_SMOOTH * raw_y) + ((1.0f - ALPHA_SMOOTH) * smoothed_gyro[1]);
-    smoothed_gyro[2] = (ALPHA_SMOOTH * raw_z) + ((1.0f - ALPHA_SMOOTH) * smoothed_gyro[2]);
+    // Your exact smoothing logic and zero-bleed enforcement
+    smoothed_gyro[0] = ALPHA_ACCEL * speed_pitch + (1.0f - ALPHA_ACCEL) * smoothed_gyro[0]; 
+    smoothed_gyro[1] = ALPHA_ACCEL * final_horizontal_speed + (1.0f - ALPHA_ACCEL) * smoothed_gyro[1]; 
+    smoothed_gyro[2] = 0.0f; 
 
-    // Update States
-    last_H[0] = H[0]; last_H[1] = H[1]; last_H[2] = H[2];
-    last_timestamp = timestamp;
+    // State Updates
+    last_pitch = pitch; last_roll = roll; 
+    last_hx = hx; last_hy = hy; last_hz = hz; 
+    last_timestamp = timestamp; 
 }
 
 ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent* events, size_t count) {
@@ -135,18 +123,16 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
             latest_ts = events[i].timestamp;
             
             if (events[i].type == ASENSOR_TYPE_ACCELEROMETER) {
-                last_A[0] = events[i].acceleration.x;
-                last_A[1] = events[i].acceleration.y;
-                last_A[2] = events[i].acceleration.z;
-                normalize(last_A);
+                last_accel[0] = events[i].acceleration.x;
+                last_accel[1] = events[i].acceleration.y;
+                last_accel[2] = events[i].acceleration.z;
                 fusion_ready = true;
             } 
-            // RESTORED UNCALIBRATED MAG WITH YOUR HARDCODED BIASES
+            // YOUR UNCALIBRATED MAG RESTORED
             else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || events[i].type == 14) {
-                last_M[0] = events[i].uncalibrated_magnetic.x_uncalib - HARD_IRON_X;
-                last_M[1] = events[i].uncalibrated_magnetic.y_uncalib - HARD_IRON_Y;
-                last_M[2] = events[i].uncalibrated_magnetic.z_uncalib - HARD_IRON_Z;
-                normalize(last_M);
+                last_mag[0] = events[i].uncalibrated_magnetic.x_uncalib - HARD_IRON_X;
+                last_mag[1] = events[i].uncalibrated_magnetic.y_uncalib - HARD_IRON_Y;
+                last_mag[2] = events[i].uncalibrated_magnetic.z_uncalib - HARD_IRON_Z;
                 fusion_ready = true;
             }
             else if (events[i].type == ASENSOR_TYPE_GYROSCOPE || events[i].type == 4 || events[i].type == 16) {
@@ -157,7 +143,7 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
         }
 
         if (fusion_ready && latest_ts > 0) {
-            compute_vector_kinematics(latest_ts);
+            compute_sensor_fusion(latest_ts);
         }
     }
     return actual_events;
