@@ -5,7 +5,7 @@
 #include "dobby.h"
 #include "zygisk.hpp"
 
-// Production Build: Pure Quaternion Time Derivative (Zero Euler Angles = Zero Snaps)
+// Production Build: Quaternion Velocity Extraction + 9006.png Custom Mapping
 static const float ALPHA_ACCEL = 0.65f; 
 static const float MAG_NOISE_GATE = 0.015f; 
 
@@ -20,7 +20,7 @@ static float smoothed_gyro[3] = {0.0f, 0.0f, 0.0f};
 static float last_accel[3] = {0.0f, 0.0f, 9.81f}; 
 static float last_mag[3] = {0.0f, 1.0f, 0.0f}; 
 static int64_t last_timestamp = 0; 
-static float last_q[4] = {1.0f, 0.0f, 0.0f, 0.0f}; // Quaternion state
+static float last_q[4] = {1.0f, 0.0f, 0.0f, 0.0f}; 
 
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t); 
 static getEvents_t orig_getEvents = nullptr; 
@@ -70,20 +70,23 @@ void matrix_to_quat(float R[3][3], float q[4]) {
 }
 
 void compute_quaternion_kinematics(int64_t timestamp) {
-    // 1. Prepare vectors
     float A[3] = {last_accel[0], last_accel[1], last_accel[2]};
-    normalize(A); // Z-axis of Rotation Matrix
+    normalize(A); 
     
     float M[3] = {last_mag[0], last_mag[1], last_mag[2]};
     normalize(M);
 
-    // 2. Build absolute 3D Orthogonal Basis (Rotation Matrix)
+    // 1. Build Orthogonal Basis safely
     float E[3]; cross_product(M, A, E); 
     float E_norm = sqrt(E[0]*E[0] + E[1]*E[1] + E[2]*E[2]);
-    if (E_norm > 0.001f) { E[0]/=E_norm; E[1]/=E_norm; E[2]/=E_norm; } // X-axis
+    if (E_norm < 0.001f) { 
+        E[0] = 1.0f; E[1] = 0.0f; E[2] = 0.0f; 
+    } else { 
+        E[0]/=E_norm; E[1]/=E_norm; E[2]/=E_norm; 
+    }
     
     float N[3]; cross_product(A, E, N); 
-    normalize(N); // Y-axis
+    normalize(N); 
 
     float R[3][3] = {
         {E[0], N[0], A[0]},
@@ -91,7 +94,6 @@ void compute_quaternion_kinematics(int64_t timestamp) {
         {E[2], N[2], A[2]}
     };
 
-    // 3. Convert Matrix to Current Quaternion
     float q_curr[4];
     matrix_to_quat(R, q_curr);
 
@@ -107,36 +109,38 @@ void compute_quaternion_kinematics(int64_t timestamp) {
         return; 
     }
 
-    // 4. Calculate Time Derivative using Quaternion Multiplication
-    // dq = last_q_inverse * q_curr
-    // This perfectly extracts the rotation that occurred IN THE HARDWARE'S LOCAL FRAME
+    // 2. Quaternion Time Derivative (Immune to atan2 Gimbal Lock snaps)
     float dq_w = last_q[0]*q_curr[0] + last_q[1]*q_curr[1] + last_q[2]*q_curr[2] + last_q[3]*q_curr[3];
     float dq_x = last_q[0]*q_curr[1] - last_q[1]*q_curr[0] - last_q[2]*q_curr[3] + last_q[3]*q_curr[2];
     float dq_y = last_q[0]*q_curr[2] + last_q[1]*q_curr[3] - last_q[2]*q_curr[0] - last_q[3]*q_curr[1];
     float dq_z = last_q[0]*q_curr[3] - last_q[1]*q_curr[2] + last_q[2]*q_curr[1] - last_q[3]*q_curr[0];
 
-    // Enforce shortest path rotation (prevents invisible math flips)
     if (dq_w < 0.0f) {
         dq_w = -dq_w; dq_x = -dq_x; dq_y = -dq_y; dq_z = -dq_z;
     }
 
-    // 5. Extract Angular Velocity (Radians per second)
-    // Small angle approximation w = 2 * dq.xyz / dt
-    float speed_x = (2.0f * dq_x) / raw_dt;
-    float speed_y = (2.0f * dq_y) / raw_dt;
-    float speed_z = (2.0f * dq_z) / raw_dt;
+    float wx = (2.0f * dq_x) / raw_dt;
+    float wy = (2.0f * dq_y) / raw_dt;
+    float wz = (2.0f * dq_z) / raw_dt;
 
-    // Apply Noise Gate to nullify micro-vibrations
-    if (fabs(speed_x) < MAG_NOISE_GATE) speed_x = 0.0f;
-    if (fabs(speed_y) < MAG_NOISE_GATE) speed_y = 0.0f;
-    if (fabs(speed_z) < MAG_NOISE_GATE) speed_z = 0.0f;
+    // 3. Dynamically route the 3D velocities into your exact 2D screen mapping
+    float speed_pitch = (wx * A[1]) - (wy * A[0]);               // Vertical Aim
+    float speed_roll  = (wy * A[1]) + (wx * A[0]);               // Steering Wheel
+    float speed_yaw   = (wx * A[0]) + (wy * A[1]) + (wz * A[2]); // Bicycle Handlebars
 
-    // 6. Apply your EXACT 0.65f Low-Pass filter to smooth the raw derivative
-    smoothed_gyro[0] = ALPHA_ACCEL * speed_x + (1.0f - ALPHA_ACCEL) * smoothed_gyro[0]; 
-    smoothed_gyro[1] = ALPHA_ACCEL * speed_y + (1.0f - ALPHA_ACCEL) * smoothed_gyro[1]; 
-    smoothed_gyro[2] = ALPHA_ACCEL * speed_z + (1.0f - ALPHA_ACCEL) * smoothed_gyro[2]; 
+    if (fabs(speed_yaw) < MAG_NOISE_GATE) speed_yaw = 0.0f; 
 
-    // 7. Update States
+    // 4. Your Universal Fade Factor (Uses Z-Gravity to detect TV hold vs flat)
+    float fade_factor = pow(1.0f - (A[2] * A[2]), 2.0f); 
+
+    // 5. Your precise 9006.png horizontal synthesis
+    float final_horizontal_speed = (speed_roll * (1.0f - fade_factor)) + (speed_yaw * fade_factor); 
+
+    // 6. Direct output mapping with Z-axis cull
+    smoothed_gyro[0] = ALPHA_ACCEL * speed_pitch + (1.0f - ALPHA_ACCEL) * smoothed_gyro[0]; 
+    smoothed_gyro[1] = ALPHA_ACCEL * final_horizontal_speed + (1.0f - ALPHA_ACCEL) * smoothed_gyro[1]; 
+    smoothed_gyro[2] = 0.0f; 
+
     memcpy(last_q, q_curr, sizeof(q_curr));
     last_timestamp = timestamp; 
 }
@@ -156,7 +160,6 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                 last_accel[2] = events[i].acceleration.z;
                 fusion_ready = true;
             } 
-            // YOUR UNCALIBRATED MAG RESTORED
             else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || events[i].type == 14) {
                 last_mag[0] = events[i].uncalibrated_magnetic.x_uncalib - HARD_IRON_X;
                 last_mag[1] = events[i].uncalibrated_magnetic.y_uncalib - HARD_IRON_Y;
