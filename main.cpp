@@ -41,14 +41,13 @@ void compute_sensor_fusion(int64_t timestamp) {
     if (G < 0.1f) G = 0.1f; 
     float gx = ax / G; float gy = ay / G; float gz = az / G; 
 
-    // Original Pitch and Roll Extraction
     float pitch = atan2(ay, az); 
     float normalized_ax = -ax / G; 
     if (normalized_ax > 1.0f) normalized_ax = 1.0f; 
     if (normalized_ax < -1.0f) normalized_ax = -1.0f; 
     float roll = asin(normalized_ax); 
 
-    // Original Horizontal Magnetic Projection
+    // Horizontal Magnetic Projection
     float dot_mg = mx * gx + my * gy + mz * gz; 
     float hx = mx - dot_mg * gx; 
     float hy = my - dot_mg * gy; 
@@ -71,7 +70,7 @@ void compute_sensor_fusion(int64_t timestamp) {
         return; 
     }
 
-    // --- SNAP FIX 1: Boundary Wrapping for Pitch/Roll ---
+    // Boundary Wrapping for Pitch/Roll (Prevents atan2 spikes)
     float delta_pitch = pitch - last_pitch;
     while (delta_pitch > M_PI) delta_pitch -= 2.0f * M_PI;
     while (delta_pitch < -M_PI) delta_pitch += 2.0f * M_PI;
@@ -82,13 +81,11 @@ void compute_sensor_fusion(int64_t timestamp) {
     while (delta_roll < -M_PI) delta_roll += 2.0f * M_PI;
     float speed_roll = delta_roll / raw_dt; 
 
-    // --- SNAP FIX 2: Cross Product Asin for Yaw ---
+    // Cross Product Asin for Yaw (Cures the 180-degree teleportation snap)
     float cx = last_hy * hz - last_hz * hy; 
     float cy = last_hz * hx - last_hx * hz; 
     float cz = last_hx * hy - last_hy * hx; 
     
-    // This perfectly extracts the signed rotation magnitude around the Gravity vector.
-    // If hx,hy,hz teleports 180 degrees, this naturally outputs 0 instead of a massive spike.
     float sin_yaw = cx * gx + cy * gy + cz * gz; 
     if (sin_yaw > 1.0f) sin_yaw = 1.0f;
     if (sin_yaw < -1.0f) sin_yaw = -1.0f;
@@ -98,11 +95,15 @@ void compute_sensor_fusion(int64_t timestamp) {
     
     if (fabs(speed_yaw) < MAG_NOISE_GATE) speed_yaw = 0.0f; 
 
-    // --- YOUR EXACT ORIGINAL FADE FACTOR AND SYNTHESIS ---
-    float fade_factor = pow(fabs(sin(pitch)), 4.0f); 
+    // --- UNIVERSAL FADE FACTOR ---
+    // Uses the Z-axis gravity (gz). 
+    // If phone is flat on a desk (gz = 1), fade_factor = 0 (Uses Accelerometer).
+    // If phone is perfectly vertical (gz = 0), fade_factor = 1 (Uses Magnetometer).
+    float fade_factor = pow(1.0f - (gz * gz), 2.0f); 
+    
     float final_horizontal_speed = (speed_roll * (1.0f - fade_factor)) + (speed_yaw * fade_factor); 
 
-    // Your exact smoothing logic and zero-bleed enforcement
+    // Smoothing Logic
     smoothed_gyro[0] = ALPHA_ACCEL * speed_pitch + (1.0f - ALPHA_ACCEL) * smoothed_gyro[0]; 
     smoothed_gyro[1] = ALPHA_ACCEL * final_horizontal_speed + (1.0f - ALPHA_ACCEL) * smoothed_gyro[1]; 
     smoothed_gyro[2] = 0.0f; 
