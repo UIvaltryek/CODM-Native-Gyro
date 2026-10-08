@@ -5,7 +5,7 @@
 #include "dobby.h"
 #include "zygisk.hpp"
 
-// Production Build: Your exact original architecture restored
+// Production Build: Pure Quaternion Time Derivative (Zero Euler Angles = Zero Snaps)
 static const float ALPHA_ACCEL = 0.65f; 
 static const float MAG_NOISE_GATE = 0.015f; 
 
@@ -20,47 +20,84 @@ static float smoothed_gyro[3] = {0.0f, 0.0f, 0.0f};
 static float last_accel[3] = {0.0f, 0.0f, 9.81f}; 
 static float last_mag[3] = {0.0f, 1.0f, 0.0f}; 
 static int64_t last_timestamp = 0; 
-
-static float last_pitch = 0.0f; 
-static float last_roll = 0.0f; 
-static float last_hx = 0.0f; 
-static float last_hy = 1.0f; 
-static float last_hz = 0.0f; 
+static float last_q[4] = {1.0f, 0.0f, 0.0f, 0.0f}; // Quaternion state
 
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t); 
 static getEvents_t orig_getEvents = nullptr; 
 typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
 static setEventRate_t orig_setEventRate = nullptr;
 
-void compute_sensor_fusion(int64_t timestamp) {
-    float ax = last_accel[0]; float ay = last_accel[1]; float az = last_accel[2]; 
-    float mx = last_mag[0]; float my = last_mag[1]; float mz = last_mag[2]; 
+void normalize(float v[3]) {
+    float norm = sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+    if (norm > 0.0001f) { v[0] /= norm; v[1] /= norm; v[2] /= norm; }
+}
 
-    // Gravity Normalization
-    float G = sqrt(ax*ax + ay*ay + az*az); 
-    if (G < 0.1f) G = 0.1f; 
-    float gx = ax / G; float gy = ay / G; float gz = az / G; 
+void cross_product(float a[3], float b[3], float out[3]) {
+    out[0] = a[1]*b[2] - a[2]*b[1];
+    out[1] = a[2]*b[0] - a[0]*b[2];
+    out[2] = a[0]*b[1] - a[1]*b[0];
+}
 
-    float pitch = atan2(ay, az); 
-    float normalized_ax = -ax / G; 
-    if (normalized_ax > 1.0f) normalized_ax = 1.0f; 
-    if (normalized_ax < -1.0f) normalized_ax = -1.0f; 
-    float roll = asin(normalized_ax); 
+void matrix_to_quat(float R[3][3], float q[4]) {
+    float tr = R[0][0] + R[1][1] + R[2][2];
+    if (tr > 0.0f) { 
+        float S = sqrt(tr + 1.0f) * 2.0f; 
+        q[0] = 0.25f * S; 
+        q[1] = (R[1][2] - R[2][1]) / S; 
+        q[2] = (R[2][0] - R[0][2]) / S; 
+        q[3] = (R[0][1] - R[1][0]) / S; 
+    } else if ((R[0][0] > R[1][1]) && (R[0][0] > R[2][2])) { 
+        float S = sqrt(1.0f + R[0][0] - R[1][1] - R[2][2]) * 2.0f; 
+        q[0] = (R[1][2] - R[2][1]) / S; 
+        q[1] = 0.25f * S; 
+        q[2] = (R[0][1] + R[1][0]) / S; 
+        q[3] = (R[2][0] + R[0][2]) / S; 
+    } else if (R[1][1] > R[2][2]) { 
+        float S = sqrt(1.0f + R[1][1] - R[0][0] - R[2][2]) * 2.0f; 
+        q[0] = (R[2][0] - R[0][2]) / S; 
+        q[1] = (R[0][1] + R[1][0]) / S; 
+        q[2] = 0.25f * S; 
+        q[3] = (R[1][2] + R[2][1]) / S; 
+    } else { 
+        float S = sqrt(1.0f + R[2][2] - R[0][0] - R[1][1]) * 2.0f; 
+        q[0] = (R[0][1] - R[1][0]) / S; 
+        q[1] = (R[2][0] + R[0][2]) / S; 
+        q[2] = (R[1][2] + R[2][1]) / S; 
+        q[3] = 0.25f * S; 
+    }
+    float norm = sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
+    if (norm > 0.0001f) { q[0]/=norm; q[1]/=norm; q[2]/=norm; q[3]/=norm; }
+}
 
-    // Horizontal Magnetic Projection
-    float dot_mg = mx * gx + my * gy + mz * gz; 
-    float hx = mx - dot_mg * gx; 
-    float hy = my - dot_mg * gy; 
-    float hz = mz - dot_mg * gz; 
+void compute_quaternion_kinematics(int64_t timestamp) {
+    // 1. Prepare vectors
+    float A[3] = {last_accel[0], last_accel[1], last_accel[2]};
+    normalize(A); // Z-axis of Rotation Matrix
+    
+    float M[3] = {last_mag[0], last_mag[1], last_mag[2]};
+    normalize(M);
 
-    float H = sqrt(hx*hx + hy*hy + hz*hz); 
-    if (H < 0.01f) H = 0.01f; 
-    hx /= H; hy /= H; hz /= H; 
+    // 2. Build absolute 3D Orthogonal Basis (Rotation Matrix)
+    float E[3]; cross_product(M, A, E); 
+    float E_norm = sqrt(E[0]*E[0] + E[1]*E[1] + E[2]*E[2]);
+    if (E_norm > 0.001f) { E[0]/=E_norm; E[1]/=E_norm; E[2]/=E_norm; } // X-axis
+    
+    float N[3]; cross_product(A, E, N); 
+    normalize(N); // Y-axis
+
+    float R[3][3] = {
+        {E[0], N[0], A[0]},
+        {E[1], N[1], A[1]},
+        {E[2], N[2], A[2]}
+    };
+
+    // 3. Convert Matrix to Current Quaternion
+    float q_curr[4];
+    matrix_to_quat(R, q_curr);
 
     if (last_timestamp == 0) { 
         last_timestamp = timestamp; 
-        last_pitch = pitch; last_roll = roll; 
-        last_hx = hx; last_hy = hy; last_hz = hz; 
+        memcpy(last_q, q_curr, sizeof(q_curr));
         return; 
     }
 
@@ -70,47 +107,37 @@ void compute_sensor_fusion(int64_t timestamp) {
         return; 
     }
 
-    // Boundary Wrapping for Pitch/Roll (Prevents atan2 spikes)
-    float delta_pitch = pitch - last_pitch;
-    while (delta_pitch > M_PI) delta_pitch -= 2.0f * M_PI;
-    while (delta_pitch < -M_PI) delta_pitch += 2.0f * M_PI;
-    float speed_pitch = delta_pitch / raw_dt; 
+    // 4. Calculate Time Derivative using Quaternion Multiplication
+    // dq = last_q_inverse * q_curr
+    // This perfectly extracts the rotation that occurred IN THE HARDWARE'S LOCAL FRAME
+    float dq_w = last_q[0]*q_curr[0] + last_q[1]*q_curr[1] + last_q[2]*q_curr[2] + last_q[3]*q_curr[3];
+    float dq_x = last_q[0]*q_curr[1] - last_q[1]*q_curr[0] - last_q[2]*q_curr[3] + last_q[3]*q_curr[2];
+    float dq_y = last_q[0]*q_curr[2] + last_q[1]*q_curr[3] - last_q[2]*q_curr[0] - last_q[3]*q_curr[1];
+    float dq_z = last_q[0]*q_curr[3] - last_q[1]*q_curr[2] + last_q[2]*q_curr[1] - last_q[3]*q_curr[0];
 
-    float delta_roll = roll - last_roll;
-    while (delta_roll > M_PI) delta_roll -= 2.0f * M_PI;
-    while (delta_roll < -M_PI) delta_roll += 2.0f * M_PI;
-    float speed_roll = delta_roll / raw_dt; 
+    // Enforce shortest path rotation (prevents invisible math flips)
+    if (dq_w < 0.0f) {
+        dq_w = -dq_w; dq_x = -dq_x; dq_y = -dq_y; dq_z = -dq_z;
+    }
 
-    // Cross Product Asin for Yaw (Cures the 180-degree teleportation snap)
-    float cx = last_hy * hz - last_hz * hy; 
-    float cy = last_hz * hx - last_hx * hz; 
-    float cz = last_hx * hy - last_hy * hx; 
-    
-    float sin_yaw = cx * gx + cy * gy + cz * gz; 
-    if (sin_yaw > 1.0f) sin_yaw = 1.0f;
-    if (sin_yaw < -1.0f) sin_yaw = -1.0f;
-    
-    float mag_delta_yaw = asin(sin_yaw); 
-    float speed_yaw = mag_delta_yaw / raw_dt; 
-    
-    if (fabs(speed_yaw) < MAG_NOISE_GATE) speed_yaw = 0.0f; 
+    // 5. Extract Angular Velocity (Radians per second)
+    // Small angle approximation w = 2 * dq.xyz / dt
+    float speed_x = (2.0f * dq_x) / raw_dt;
+    float speed_y = (2.0f * dq_y) / raw_dt;
+    float speed_z = (2.0f * dq_z) / raw_dt;
 
-    // --- UNIVERSAL FADE FACTOR ---
-    // Uses the Z-axis gravity (gz). 
-    // If phone is flat on a desk (gz = 1), fade_factor = 0 (Uses Accelerometer).
-    // If phone is perfectly vertical (gz = 0), fade_factor = 1 (Uses Magnetometer).
-    float fade_factor = pow(1.0f - (gz * gz), 2.0f); 
-    
-    float final_horizontal_speed = (speed_roll * (1.0f - fade_factor)) + (speed_yaw * fade_factor); 
+    // Apply Noise Gate to nullify micro-vibrations
+    if (fabs(speed_x) < MAG_NOISE_GATE) speed_x = 0.0f;
+    if (fabs(speed_y) < MAG_NOISE_GATE) speed_y = 0.0f;
+    if (fabs(speed_z) < MAG_NOISE_GATE) speed_z = 0.0f;
 
-    // Smoothing Logic
-    smoothed_gyro[0] = ALPHA_ACCEL * speed_pitch + (1.0f - ALPHA_ACCEL) * smoothed_gyro[0]; 
-    smoothed_gyro[1] = ALPHA_ACCEL * final_horizontal_speed + (1.0f - ALPHA_ACCEL) * smoothed_gyro[1]; 
-    smoothed_gyro[2] = 0.0f; 
+    // 6. Apply your EXACT 0.65f Low-Pass filter to smooth the raw derivative
+    smoothed_gyro[0] = ALPHA_ACCEL * speed_x + (1.0f - ALPHA_ACCEL) * smoothed_gyro[0]; 
+    smoothed_gyro[1] = ALPHA_ACCEL * speed_y + (1.0f - ALPHA_ACCEL) * smoothed_gyro[1]; 
+    smoothed_gyro[2] = ALPHA_ACCEL * speed_z + (1.0f - ALPHA_ACCEL) * smoothed_gyro[2]; 
 
-    // State Updates
-    last_pitch = pitch; last_roll = roll; 
-    last_hx = hx; last_hy = hy; last_hz = hz; 
+    // 7. Update States
+    memcpy(last_q, q_curr, sizeof(q_curr));
     last_timestamp = timestamp; 
 }
 
@@ -144,7 +171,7 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
         }
 
         if (fusion_ready && latest_ts > 0) {
-            compute_sensor_fusion(latest_ts);
+            compute_quaternion_kinematics(latest_ts);
         }
     }
     return actual_events;
