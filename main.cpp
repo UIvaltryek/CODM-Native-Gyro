@@ -5,101 +5,122 @@
 #include "dobby.h"
 #include "zygisk.hpp"
 
-// Production Build: Quaternion Velocity Extraction + 9006.png Custom Mapping
-static const float ALPHA_ACCEL = 0.65f; 
+// Production Build: Direct Addition + Min-Delay Mahony AHRS
 static const float MAG_NOISE_GATE = 0.015f; 
+
+// --- MAHONY AHRS TUNING (Min Delay) ---
+static const float Kp = 1.5f; // Fast, aggressive noise correction
+static const float Ki = 0.0f; // Zero integral windup (no lag)
 
 // --- FACTORY BIASES (MT6835 Hard-Iron Offsets) ---
 static const float HARD_IRON_X = 93.76f;
 static const float HARD_IRON_Y = -29.09f;
 static const float HARD_IRON_Z = 967.01f;
 
-static float smoothed_gyro[3] = {0.0f, 0.0f, 0.0f}; 
+static float final_gyro[3] = {0.0f, 0.0f, 0.0f}; 
 
 // Sensor States
 static float last_accel[3] = {0.0f, 0.0f, 9.81f}; 
 static float last_mag[3] = {0.0f, 1.0f, 0.0f}; 
 static int64_t last_timestamp = 0; 
-static float last_q[4] = {1.0f, 0.0f, 0.0f, 0.0f}; 
+
+static float last_pitch = 0.0f; 
+static float last_roll = 0.0f; 
+static float last_hx = 0.0f; 
+static float last_hy = 1.0f; 
+static float last_hz = 0.0f; 
+
+// Mahony States
+static float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
 
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t); 
 static getEvents_t orig_getEvents = nullptr; 
 typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
 static setEventRate_t orig_setEventRate = nullptr;
 
-void normalize(float v[3]) {
-    float norm = sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
-    if (norm > 0.0001f) { v[0] /= norm; v[1] /= norm; v[2] /= norm; }
-}
+void MahonyAHRSupdate(float gx, float gy, float gz, float ax, float ay, float az, float mx, float my, float mz, float dt, float& out_gx, float& out_gy, float& out_gz) {
+    float recipNorm;
+    float q0q0, q0q1, q0q2, q0q3, q1q1, q1q2, q1q3, q2q2, q2q3, q3q3;
+    float hx, hy, bx, bz;
+    float halfvx, halfvy, halfvz, halfwx, halfwy, halfwz;
+    float halfex, halfey, halfez;
+    float qa, qb, qc;
 
-void cross_product(float a[3], float b[3], float out[3]) {
-    out[0] = a[1]*b[2] - a[2]*b[1];
-    out[1] = a[2]*b[0] - a[0]*b[2];
-    out[2] = a[0]*b[1] - a[1]*b[0];
-}
+    if(!((ax == 0.0f) && (ay == 0.0f) && (az == 0.0f))) {
+        recipNorm = 1.0f / sqrt(ax * ax + ay * ay + az * az);
+        ax *= recipNorm; ay *= recipNorm; az *= recipNorm;
 
-void matrix_to_quat(float R[3][3], float q[4]) {
-    float tr = R[0][0] + R[1][1] + R[2][2];
-    if (tr > 0.0f) { 
-        float S = sqrt(tr + 1.0f) * 2.0f; 
-        q[0] = 0.25f * S; 
-        q[1] = (R[1][2] - R[2][1]) / S; 
-        q[2] = (R[2][0] - R[0][2]) / S; 
-        q[3] = (R[0][1] - R[1][0]) / S; 
-    } else if ((R[0][0] > R[1][1]) && (R[0][0] > R[2][2])) { 
-        float S = sqrt(1.0f + R[0][0] - R[1][1] - R[2][2]) * 2.0f; 
-        q[0] = (R[1][2] - R[2][1]) / S; 
-        q[1] = 0.25f * S; 
-        q[2] = (R[0][1] + R[1][0]) / S; 
-        q[3] = (R[2][0] + R[0][2]) / S; 
-    } else if (R[1][1] > R[2][2]) { 
-        float S = sqrt(1.0f + R[1][1] - R[0][0] - R[2][2]) * 2.0f; 
-        q[0] = (R[2][0] - R[0][2]) / S; 
-        q[1] = (R[0][1] + R[1][0]) / S; 
-        q[2] = 0.25f * S; 
-        q[3] = (R[1][2] + R[2][1]) / S; 
-    } else { 
-        float S = sqrt(1.0f + R[2][2] - R[0][0] - R[1][1]) * 2.0f; 
-        q[0] = (R[0][1] - R[1][0]) / S; 
-        q[1] = (R[2][0] + R[0][2]) / S; 
-        q[2] = (R[1][2] + R[2][1]) / S; 
-        q[3] = 0.25f * S; 
+        recipNorm = 1.0f / sqrt(mx * mx + my * my + mz * mz);
+        mx *= recipNorm; my *= recipNorm; mz *= recipNorm;
+
+        q0q0 = q0 * q0; q0q1 = q0 * q1; q0q2 = q0 * q2; q0q3 = q0 * q3;
+        q1q1 = q1 * q1; q1q2 = q1 * q2; q1q3 = q1 * q3;
+        q2q2 = q2 * q2; q2q3 = q2 * q3; q3q3 = q3 * q3;
+
+        hx = 2.0f * (mx * (0.5f - q2q2 - q3q3) + my * (q1q2 - q0q3) + mz * (q1q3 + q0q2));
+        hy = 2.0f * (mx * (q1q2 + q0q3) + my * (0.5f - q1q1 - q3q3) + mz * (q2q3 - q0q1));
+        bx = sqrt(hx * hx + hy * hy);
+        bz = 2.0f * (mx * (q1q3 - q0q2) + my * (q2q3 + q0q1) + mz * (0.5f - q1q1 - q2q2));
+
+        halfvx = q1q3 - q0q2;
+        halfvy = q0q1 + q2q3;
+        halfvz = q0q0 - 0.5f + q3q3;
+        halfwx = bx * (0.5f - q2q2 - q3q3) + bz * (q1q3 - q0q2);
+        halfwy = bx * (q1q2 - q0q3) + bz * (q0q1 + q2q3);
+        halfwz = bx * (q0q2 + q1q3) + bz * (0.5f - q1q1 - q2q2);
+
+        halfex = (ay * halfvz - az * halfvy) + (my * halfwz - mz * halfwy);
+        halfey = (az * halfvx - ax * halfvz) + (mz * halfwx - mx * halfwz);
+        halfez = (ax * halfvy - ay * halfvx) + (mx * halfwy - my * halfwx);
+
+        gx += Kp * halfex;
+        gy += Kp * halfey;
+        gz += Kp * halfez;
     }
-    float norm = sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
-    if (norm > 0.0001f) { q[0]/=norm; q[1]/=norm; q[2]/=norm; q[3]/=norm; }
+
+    out_gx = gx;
+    out_gy = gy;
+    out_gz = gz;
+
+    gx *= (0.5f * dt); gy *= (0.5f * dt); gz *= (0.5f * dt);
+    qa = q0; qb = q1; qc = q2;
+    q0 += (-qb * gx - qc * gy - q3 * gz);
+    q1 += (qa * gx + qc * gz - q3 * gy);
+    q2 += (qa * gy - qb * gz + q3 * gx);
+    q3 += (qa * gz + qb * gy - qc * gx);
+
+    recipNorm = 1.0f / sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+    q0 *= recipNorm; q1 *= recipNorm; q2 *= recipNorm; q3 *= recipNorm;
 }
 
-void compute_quaternion_kinematics(int64_t timestamp) {
-    float A[3] = {last_accel[0], last_accel[1], last_accel[2]};
-    normalize(A); 
-    
-    float M[3] = {last_mag[0], last_mag[1], last_mag[2]};
-    normalize(M);
+void compute_sensor_fusion(int64_t timestamp) {
+    float ax = last_accel[0]; float ay = last_accel[1]; float az = last_accel[2]; 
+    float mx = last_mag[0]; float my = last_mag[1]; float mz = last_mag[2]; 
 
-    // 1. Build Orthogonal Basis safely
-    float E[3]; cross_product(M, A, E); 
-    float E_norm = sqrt(E[0]*E[0] + E[1]*E[1] + E[2]*E[2]);
-    if (E_norm < 0.001f) { 
-        E[0] = 1.0f; E[1] = 0.0f; E[2] = 0.0f; 
-    } else { 
-        E[0]/=E_norm; E[1]/=E_norm; E[2]/=E_norm; 
-    }
-    
-    float N[3]; cross_product(A, E, N); 
-    normalize(N); 
+    float G = sqrt(ax*ax + ay*ay + az*az); 
+    if (G < 0.1f) G = 0.1f; 
+    float gx = ax / G; float gy = ay / G; float gz = az / G; 
 
-    float R[3][3] = {
-        {E[0], N[0], A[0]},
-        {E[1], N[1], A[1]},
-        {E[2], N[2], A[2]}
-    };
+    // Your Exact Methods
+    float pitch = atan2(ay, az); 
+    float normalized_ax = -ax / G; 
+    if (normalized_ax > 1.0f) normalized_ax = 1.0f; 
+    if (normalized_ax < -1.0f) normalized_ax = -1.0f; 
+    float roll = asin(normalized_ax); 
 
-    float q_curr[4];
-    matrix_to_quat(R, q_curr);
+    float dot_mg = mx * gx + my * gy + mz * gz; 
+    float hx = mx - dot_mg * gx; 
+    float hy = my - dot_mg * gy; 
+    float hz = mz - dot_mg * gz; 
+
+    float H = sqrt(hx*hx + hy*hy + hz*hz); 
+    if (H < 0.01f) H = 0.01f; 
+    hx /= H; hy /= H; hz /= H; 
 
     if (last_timestamp == 0) { 
         last_timestamp = timestamp; 
-        memcpy(last_q, q_curr, sizeof(q_curr));
+        last_pitch = pitch; last_roll = roll; 
+        last_hx = hx; last_hy = hy; last_hz = hz; 
         return; 
     }
 
@@ -109,39 +130,48 @@ void compute_quaternion_kinematics(int64_t timestamp) {
         return; 
     }
 
-    // 2. Quaternion Time Derivative (Immune to atan2 Gimbal Lock snaps)
-    float dq_w = last_q[0]*q_curr[0] + last_q[1]*q_curr[1] + last_q[2]*q_curr[2] + last_q[3]*q_curr[3];
-    float dq_x = last_q[0]*q_curr[1] - last_q[1]*q_curr[0] - last_q[2]*q_curr[3] + last_q[3]*q_curr[2];
-    float dq_y = last_q[0]*q_curr[2] + last_q[1]*q_curr[3] - last_q[2]*q_curr[0] - last_q[3]*q_curr[1];
-    float dq_z = last_q[0]*q_curr[3] - last_q[1]*q_curr[2] + last_q[2]*q_curr[1] - last_q[3]*q_curr[0];
+    float delta_pitch = pitch - last_pitch;
+    while (delta_pitch > M_PI) delta_pitch -= 2.0f * M_PI;
+    while (delta_pitch < -M_PI) delta_pitch += 2.0f * M_PI;
+    float speed_pitch = delta_pitch / raw_dt; 
 
-    if (dq_w < 0.0f) {
-        dq_w = -dq_w; dq_x = -dq_x; dq_y = -dq_y; dq_z = -dq_z;
-    }
+    float delta_roll = roll - last_roll;
+    while (delta_roll > M_PI) delta_roll -= 2.0f * M_PI;
+    while (delta_roll < -M_PI) delta_roll += 2.0f * M_PI;
+    float speed_roll = delta_roll / raw_dt; 
 
-    float wx = (2.0f * dq_x) / raw_dt;
-    float wy = (2.0f * dq_y) / raw_dt;
-    float wz = (2.0f * dq_z) / raw_dt;
-
-    // 3. Dynamically route the 3D velocities into your exact 2D screen mapping
-    float speed_pitch = (wx * A[1]) - (wy * A[0]);               // Vertical Aim
-    float speed_roll  = (wy * A[1]) + (wx * A[0]);               // Steering Wheel
-    float speed_yaw   = (wx * A[0]) + (wy * A[1]) + (wz * A[2]); // Bicycle Handlebars
-
+    float cx = last_hy * hz - last_hz * hy; 
+    float cy = last_hz * hx - last_hx * hz; 
+    float cz = last_hx * hy - last_hy * hx; 
+    
+    float sin_yaw = cx * gx + cy * gy + cz * gz; 
+    if (sin_yaw > 1.0f) sin_yaw = 1.0f;
+    if (sin_yaw < -1.0f) sin_yaw = -1.0f;
+    
+    float mag_delta_yaw = asin(sin_yaw); 
+    float speed_yaw = mag_delta_yaw / raw_dt; 
+    
     if (fabs(speed_yaw) < MAG_NOISE_GATE) speed_yaw = 0.0f; 
 
-    // 4. Your Universal Fade Factor (Uses Z-Gravity to detect TV hold vs flat)
-    float fade_factor = pow(1.0f - (A[2] * A[2]), 2.0f); 
+    // --- 3D HARDWARE MAPPING (Fixes Landscape Axis Swap) ---
+    // Projecting your velocities directly into 3D hardware space allows 
+    // Mahony to process them cleanly, and lets the Android OS auto-rotate 
+    // the axes flawlessly for Landscape mode.
+    float raw_wx = speed_pitch + (speed_yaw * gx); 
+    float raw_wy = speed_roll  + (speed_yaw * gy); 
+    float raw_wz = speed_yaw * gz;
 
-    // 5. Your precise 9006.png horizontal synthesis
-    float final_horizontal_speed = (speed_roll * (1.0f - fade_factor)) + (speed_yaw * fade_factor); 
+    // Filter raw hardware axes through Min-Delay Mahony AHRS
+    float clean_wx, clean_wy, clean_wz;
+    MahonyAHRSupdate(raw_wx, raw_wy, raw_wz, ax, ay, az, mx, my, mz, raw_dt, clean_wx, clean_wy, clean_wz);
 
-    // 6. Direct output mapping with Z-axis cull
-    smoothed_gyro[0] = ALPHA_ACCEL * speed_pitch + (1.0f - ALPHA_ACCEL) * smoothed_gyro[0]; 
-    smoothed_gyro[1] = ALPHA_ACCEL * final_horizontal_speed + (1.0f - ALPHA_ACCEL) * smoothed_gyro[1]; 
-    smoothed_gyro[2] = 0.0f; 
+    // Direct Output to Game
+    final_gyro[0] = clean_wx;
+    final_gyro[1] = clean_wy;
+    final_gyro[2] = clean_wz;
 
-    memcpy(last_q, q_curr, sizeof(q_curr));
+    last_pitch = pitch; last_roll = roll; 
+    last_hx = hx; last_hy = hy; last_hz = hz; 
     last_timestamp = timestamp; 
 }
 
@@ -167,14 +197,14 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                 fusion_ready = true;
             }
             else if (events[i].type == ASENSOR_TYPE_GYROSCOPE || events[i].type == 4 || events[i].type == 16) {
-                events[i].vector.x = smoothed_gyro[0]; 
-                events[i].vector.y = smoothed_gyro[1]; 
-                events[i].vector.z = smoothed_gyro[2]; 
+                events[i].vector.x = final_gyro[0]; 
+                events[i].vector.y = final_gyro[1]; 
+                events[i].vector.z = final_gyro[2]; 
             }
         }
 
         if (fusion_ready && latest_ts > 0) {
-            compute_quaternion_kinematics(latest_ts);
+            compute_sensor_fusion(latest_ts);
         }
     }
     return actual_events;
