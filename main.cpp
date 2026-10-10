@@ -9,17 +9,17 @@
 // then a Mahony AHRS pass that keeps long-term drift bounded.
 //
 // Sensor events are always in the device's natural frame (portrait on a phone); the game does the landscape
-// remap itself. So we just output the true 3D angular velocity there - orientation independent.
+// remap itself[span_14](start_span)[span_14](end_span). So we just output the true 3D angular velocity there - orientation independent[span_15](start_span)[span_15](end_span).
 //
-//   w_perp (tilt)  = -(g_prev x g_now) / dt                       (g = unit "up" from the accelerometer)
-//   w_yaw  (turn)  = -((h_prev x h_now) . g) / dt                 (h = unit horizontal magnetic direction)
+//   w_perp (tilt)  = -(g_prev x g_now) / dt                       (g = unit "up" from the accelerometer)[span_16](start_span)[span_16](end_span)
+//   w_yaw  (turn)  = -((h_prev x h_now) . g) / dt                 (h = unit horizontal magnetic direction)[span_17](start_span)[span_17](end_span)
 //   w              = w_perp + w_yaw * g
 
 static const float Kp = 1.5f;
 static const float HARD_IRON_X = 93.76f;
 static const float HARD_IRON_Y = -29.09f;
 static const float HARD_IRON_Z = 967.01f;
-static const int64_t MIN_SPAN_NS = 8000000;   // minimum baseline for differencing (5-10 ms); shorter = less lag, more jitter
+static const int64_t MIN_SPAN_NS = 8000000;   // minimum baseline for differencing (5-10 ms); shorter = less lag, more jitter[span_18](start_span)[span_18](end_span)
 
 static float final_gyro[3] = {0.0f, 0.0f, 0.0f};
 static float last_accel[3] = {0.0f, 0.0f, 9.81f};
@@ -39,16 +39,18 @@ void cross_product(float a[3], float b[3], float out[3]) {
     out[1] = a[2]*b[0] - a[0]*b[2];
     out[2] = a[0]*b[1] - a[1]*b[0];
 }
+
 void normalize(float v[3]) {
     float norm = sqrtf(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
     if (norm > 0.0001f) { v[0]/=norm; v[1]/=norm; v[2]/=norm; }
 }
+
 void seed_mahony(float ax, float ay, float az, float mx, float my, float mz) {
     float A[3] = {ax, ay, az}; normalize(A);
     float M[3] = {mx, my, mz}; normalize(M);
     float E[3]; cross_product(M, A, E); normalize(E);
     float N[3]; cross_product(A, E, N); normalize(N);
-    // Mahony's earth frame: x = magnetic north, y = WEST, z = up  ->  columns [N, -E, Up]
+    // Mahony's earth frame: x = magnetic north, y = WEST, z = up  ->  columns [N, -E, Up][span_19](start_span)[span_19](end_span)
     float R[3][3] = { {N[0], -E[0], A[0]}, {N[1], -E[1], A[1]}, {N[2], -E[2], A[2]} };
     float tr = R[0][0] + R[1][1] + R[2][2];
     if (tr > 0.0f) {
@@ -67,6 +69,7 @@ void seed_mahony(float ax, float ay, float az, float mx, float my, float mz) {
     float norm = sqrtf(q0*q0 + q1*q1 + q2*q2 + q3*q3);
     if(norm > 0.0001f) { q0/=norm; q1/=norm; q2/=norm; q3/=norm; }
 }
+
 void MahonyAHRSupdate(float gx, float gy, float gz, float ax, float ay, float az, float mx, float my, float mz, float dt, float& out_gx, float& out_gy, float& out_gz) {
     float recipNorm;
     float q0q0, q0q1, q0q2, q0q3, q1q1, q1q2, q1q3, q2q2, q2q3, q3q3;
@@ -125,7 +128,7 @@ static void fusion_accel(const float a[3], int64_t ts) {
     if (span < MIN_SPAN_NS) return;
     float dt = span / 1e9f;
     if (dt < 0.1f) {
-        float c[3]; cross_product(ref_g, g, c);               // w_perp = -(g_prev x g_now) / dt
+        float c[3]; cross_product(ref_g, g, c);               // w_perp = -(g_prev x g_now) / dt[span_20](start_span)[span_20](end_span)
         for (int i = 0; i < 3; i++) tilt_w[i] = -c[i] / dt;
     } else { tilt_w[0] = tilt_w[1] = tilt_w[2] = 0.0f; }
     memcpy(ref_g, g, sizeof g); ref_g_ts = ts;
@@ -144,7 +147,7 @@ static void fusion_mag(const float m[3], int64_t ts) {
     if (span < MIN_SPAN_NS) return;
     float dt = span / 1e9f;
     if (dt < 0.1f) {
-        float c[3]; cross_product(ref_h, h, c);               // rotation about gravity
+        float c[3]; cross_product(ref_h, h, c);               // rotation about gravity[span_21](start_span)[span_21](end_span)
         yaw_w = -(c[0]*cur_g[0] + c[1]*cur_g[1] + c[2]*cur_g[2]) / dt;
     } else { yaw_w = 0.0f; }
     memcpy(ref_h, h, sizeof h); ref_h_ts = ts;
@@ -158,7 +161,7 @@ static void fusion_finish(int64_t ts) {
     }
     float dt = (ts - last_fuse_ts) / 1e9f;
     last_fuse_ts = ts;
-    if (dt <= 0.0f || dt > 0.1f) { fusion_reset(); return; }   // gap (app paused etc): start clean, re-seed
+    if (dt <= 0.0f || dt > 0.1f) { fusion_reset(); return; }   // gap (app paused etc): start clean, re-seed[span_22](start_span)[span_22](end_span)
     float w[3] = { tilt_w[0] + yaw_w*cur_g[0], tilt_w[1] + yaw_w*cur_g[1], tilt_w[2] + yaw_w*cur_g[2] };
     MahonyAHRSupdate(w[0], w[1], w[2], last_accel[0], last_accel[1], last_accel[2],
                      last_mag[0], last_mag[1], last_mag[2], dt, final_gyro[0], final_gyro[1], final_gyro[2]);
@@ -183,7 +186,7 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
     }
     if (latest > 0) fusion_finish(latest);
 
-    for (ssize_t i = 0; i < n; i++) {                          // pass 2: gyro events get the FRESH value
+    for (ssize_t i = 0; i < n; i++) {                          // pass 2: gyro events get the FRESH value[span_23](start_span)[span_23](end_span)
         if (events[i].type == ASENSOR_TYPE_GYROSCOPE || events[i].type == 4 || events[i].type == 16) {
             events[i].vector.x = final_gyro[0];
             events[i].vector.y = final_gyro[1];
