@@ -1,279 +1,211 @@
 #include <android/sensor.h>
 #include <dlfcn.h>
+#include <stdint.h>
 #include <string.h>
-#include <cmath>
+#include <math.h>
+#include <mutex>
 #include "dobby.h"
 #include "zygisk.hpp"
 
-// VirtualGyro - Ported to C++ for Zygisk
-// Pure Kalman-style tracking filter. Zero Euler angles. Zero Gimbal Lock.
-// Natively outputs true 3D hardware velocity; the game handles display rotation remap natively.
+// =====================================================================================================
+// Virtual gyroscope (accelerometer + magnetometer) - quaternion rate observer, no Euler angles anywhere.
+//
+//  * No gimbal lock / singularity: attitude is a unit quaternion, rates come from rotation vectors.
+//    Holding the phone upright in landscape ("TV mode") is just another orientation - nothing special-cased.
+//  * Tilt (aiming up/down, rolling) is corrected ONLY by the accelerometer; turning left/right (rotation
+//    about gravity) ONLY by the magnetometer, so a magnetic disturbance can never tilt the picture.
+//  * The angular velocity is the integral state of a PI observer, and each gyro sample we hand to the game
+//    is exactly the rotation of that attitude since the previous sample -> whatever the game integrates stays
+//    locked to the attitude estimate (no random walk, no drift).
+//  * Sensor events are in the device's natural frame; the game does the landscape remap, as with a real gyro.
+//
+// Tuning (gl::Params below): tilt_hz / yaw_hz = loop bandwidths. Higher = less lag, more jitter.
+// Only rewrites gyro events the game already receives; needs accel + uncalibrated-mag events in the same
+// queue (or add your own subscription).
+// =====================================================================================================
+
+// ===================== gyroless.inc =====================
+// Virtual gyroscope from accelerometer + magnetometer. No Android dependencies, no Euler angles.
+//
+//   * Attitude is a unit quaternion q (device -> earth; earth axes: x = magnetic north, y = west, z = up).
+//   * Accelerometer corrects TILT only, magnetometer corrects YAW (rotation about gravity) only.
+//   * The rate estimate is the integral state of a PI attitude observer (a "gyro-less Mahony"):
+//         e      = tilt_error + yaw_error                   (both are small-angle rotation vectors, device frame)
+//         w_hat += Ki * e * dt                              (angular velocity estimate = what a gyro would measure)
+//         q     <- q * exp( (w_hat + Kp * e) * dt / 2 )
+//   * Output for each gyro sample = rotation of q since the previous sample / dt, so whatever the game
+//     integrates stays locked to q (no random walk, no drift).
+namespace gl {
+
+struct V3 { float x, y, z; };
+static inline V3 operator+(V3 a, V3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
+static inline V3 operator-(V3 a, V3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+static inline V3 operator*(V3 a, float s) { return {a.x * s, a.y * s, a.z * s}; }
+static inline float dot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static inline V3 cross(V3 a, V3 b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
+static inline float len(V3 a) { return sqrtf(dot(a, a)); }
+static inline float ramp(float dev, float lo, float hi) {          // 1 below lo, 0 above hi
+    float t = (dev - lo) / (hi - lo); return t <= 0.f ? 1.f : (t >= 1.f ? 0.f : 1.f - t);
+}
+
+struct Quat { float w, x, y, z; };
+static inline Quat qmul(Quat a, Quat b) {
+    return {a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+            a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+            a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+            a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w};
+}
+static inline Quat qconj(Quat a) { return {a.w, -a.x, -a.y, -a.z}; }
+static inline Quat qnorm(Quat a) {
+    float n = sqrtf(a.w * a.w + a.x * a.x + a.y * a.y + a.z * a.z);
+    if (n < 1e-12f) return {1.f, 0.f, 0.f, 0.f};
+    float s = 1.f / n; return {a.w * s, a.x * s, a.y * s, a.z * s};
+}
+static inline Quat qexp(V3 rv) {                                    // rotation vector -> quaternion
+    float th = len(rv);
+    if (th < 1e-7f) return qnorm({1.f, rv.x * 0.5f, rv.y * 0.5f, rv.z * 0.5f});
+    float s = sinf(th * 0.5f) / th; return {cosf(th * 0.5f), rv.x * s, rv.y * s, rv.z * s};
+}
+static inline V3 qlog(Quat q) {                                     // quaternion -> rotation vector (shortest arc)
+    if (q.w < 0.f) q = {-q.w, -q.x, -q.y, -q.z};
+    V3 v = {q.x, q.y, q.z}; float s = len(v);
+    if (s < 1e-7f) return v * 2.f;
+    return v * (2.f * atan2f(s, q.w) / s);
+}
+// Rows of the device->earth rotation matrix = earth axes expressed in the device frame.
+static inline V3 north_in_dev(Quat q) { return {1.f - 2.f * (q.y * q.y + q.z * q.z), 2.f * (q.x * q.y - q.w * q.z), 2.f * (q.x * q.z + q.w * q.y)}; }
+static inline V3 up_in_dev(Quat q)    { return {2.f * (q.x * q.z - q.w * q.y), 2.f * (q.w * q.x + q.y * q.z), 1.f - 2.f * (q.x * q.x + q.y * q.y)}; }
+
+static Quat quat_from_rows(V3 r0, V3 r1, V3 r2) {                   // rotation matrix given by its rows
+    float R00 = r0.x, R01 = r0.y, R02 = r0.z, R10 = r1.x, R11 = r1.y, R12 = r1.z, R20 = r2.x, R21 = r2.y, R22 = r2.z;
+    float tr = R00 + R11 + R22; Quat q;
+    if (tr > 0.f)                      { float S = sqrtf(tr + 1.f) * 2.f;                 q = {0.25f * S, (R21 - R12) / S, (R02 - R20) / S, (R10 - R01) / S}; }
+    else if (R00 > R11 && R00 > R22)   { float S = sqrtf(1.f + R00 - R11 - R22) * 2.f;   q = {(R21 - R12) / S, 0.25f * S, (R01 + R10) / S, (R02 + R20) / S}; }
+    else if (R11 > R22)                { float S = sqrtf(1.f + R11 - R00 - R22) * 2.f;   q = {(R02 - R20) / S, (R01 + R10) / S, 0.25f * S, (R12 + R21) / S}; }
+    else                               { float S = sqrtf(1.f + R22 - R00 - R11) * 2.f;   q = {(R10 - R01) / S, (R02 + R20) / S, (R12 + R21) / S, 0.25f * S}; }
+    return qnorm(q);
+}
+
+struct Params {
+    float tilt_hz  = 9.0f;    // bandwidth of the accelerometer loop (aiming up/down, rolling)
+    float yaw_hz   = 5.0f;    // bandwidth of the magnetometer loop (turning left/right) - noisiest sensor, keep it lower
+    float damping  = 0.9f;
+    float leak_s   = 2.0f;    // the rate state forgets with this time constant when nothing corrects it
+    float max_rate = 35.0f;   // rad/s clamp on the rate state
+    float max_gap  = 0.1f;    // s: longer silence (pause/resume) => restart cleanly
+    float stale    = 0.1f;    // s: a held measurement older than this is ignored
+    // trust gates: full trust below *_lo, zero trust above *_hi (relative deviations)
+    float acc_lo = 0.02f, acc_hi = 0.12f;     // | |a| - 1g | / 1g
+    float mag_lo = 0.05f, mag_hi = 0.25f;     // | |m| - usual | / usual
+    float dip_lo = 0.04f, dip_hi = 0.15f;     // change of cos(angle between field and gravity)
+};
 
 class VirtualGyro {
 public:
-    static constexpr double G = 9.80665;
+    explicit VirtualGyro(Params p = Params()) : P(p) { reset(); }
 
-    // ---- TUNING ----
-    double sigmaTilt = 0.03;                    
-    double sigmaHead = 0.03;                    
-    double handAcc = 12.0;                      
-    double gTol = 2.0;                          
-    double magTol = 0.15;                       
-    double dipTol = 8.0 * M_PI / 180.0;         
-    double jumpReject = 90.0 * M_PI / 180.0;    // Relaxed to prevent compass rejection locks
-    double outageTau = 0.15;                    
-    double deadzone = 0.0;                      // Completely removed to ensure micro-aiming passes through
-
-    // ---- STATE ----
-    bool is_init = false;
-    double q[4] = {1.0, 0.0, 0.0, 0.0};         
-    double w[3] = {0.0, 0.0, 0.0};              
-    double t = NAN;
-    bool haveA = false, haveM = false;
-    double ta0 = NAN, tm0 = NAN;
-    double a0[3] = {0}, m0[3] = {0};
-    double tAcc = NAN, tMag = NAN;
-    double mRef = 0, dipRef = 0;
-    double hRefX = 0.0, hRefY = 1.0;
-    double rejectT = 0.0;
-    double R[9] = {0};                          
-
-    // ------------------------------------------------------------------ helpers
-    static double interval(double ts, double prev) {
-        return std::isnan(prev) ? 0.01 : std::fmin(0.1, std::fmax(1e-3, ts - prev));
+    void reset() {
+        q = {1.f, 0.f, 0.f, 0.f}; w = {0.f, 0.f, 0.f}; last_out = {0.f, 0.f, 0.f};
+        ua = {0.f, 0.f, 1.f}; um = {0.f, 1.f, 0.f};
+        have_a = have_m = inited = c0_ok = false; t_last = t_out = ta = tm = 0;
+        wa = wm = 0.f; g0 = 9.80665f; m0 = 0.f; c0 = 0.f; mcount = 0;
     }
 
-    static double softGate(double dev, double tol) {
-        double x = dev / tol;
-        return x >= 1.0 ? 0.0 : 1.0 - x * x;
+    void onAccel(V3 a, int64_t t) {
+        advance(t);
+        float n = len(a); if (!(n > 1e-3f)) return;
+        float dt = ta ? (t - ta) * 1e-9f : 0.f; ta = t;
+        g0 += (n - g0) * fminf(1.f, dt / 10.f);                     // slow 1 g reference (tolerates sensor scale error)
+        wa = ramp(fabsf(n - g0) / g0, P.acc_lo, P.acc_hi);                // linear acceleration / shaking => trust less, ~0 in free fall
+        ua = a * (1.f / n); have_a = true;
     }
 
-    static void trackingGains(double T, double sigmaMeas, double sigmaAcc, double out[2]) {
-        double lam = sigmaAcc * T * T / sigmaMeas;
-        double r = (4.0 + lam - std::sqrt(8.0 * lam + lam * lam)) / 4.0;
-        double alpha = 1.0 - r * r;
-        double beta = 2.0 * (2.0 - alpha) - 4.0 * r;
-        out[0] = std::fmin(alpha, 0.9);
-        out[1] = std::fmin(std::fmax(beta, 0.0), 0.8);
-    }
-
-    static void rotvecBetween(double ux, double uy, double uz, double vx, double vy, double vz, double out[3]) {
-        double cx = uy * vz - uz * vy, cy = uz * vx - ux * vz, cz = ux * vy - uy * vx;
-        double s = std::sqrt(cx * cx + cy * cy + cz * cz);
-        if (s < 1e-12) { out[0] = out[1] = out[2] = 0.0; return; }
-        double k = std::atan2(s, ux * vx + uy * vy + uz * vz) / s;
-        out[0] = cx * k; out[1] = cy * k; out[2] = cz * k;
-    }
-
-    static void qMul(const double a[4], const double b[4], double out[4]) {
-        out[0] = a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3];
-        out[1] = a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2];
-        out[2] = a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1];
-        out[3] = a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0];
-    }
-
-    static void qNormalize(double q[4]) {
-        double n = std::sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
-        if(n > 1e-9) { q[0] /= n; q[1] /= n; q[2] /= n; q[3] /= n; }
-    }
-
-    static void qExp(double x, double y, double z, double out[4]) {
-        double ang = std::sqrt(x * x + y * y + z * z);
-        if (ang < 1e-9) {
-            out[0] = 1.0; out[1] = 0.5 * x; out[2] = 0.5 * y; out[3] = 0.5 * z;
-            qNormalize(out);
-            return;
+    void onMag(V3 m, int64_t t) {
+        advance(t);
+        float n = len(m); if (!(n > 1e-3f)) return;
+        float dt = tm ? (t - tm) * 1e-9f : 0.f; tm = t;
+        float k = fmaxf(fminf(1.f, dt / 10.f), 1.f / (1.f + mcount)); if (mcount < 100000) mcount++;
+        if (m0 <= 0.f) m0 = n;
+        float wmag = ramp(fabsf(n - m0) / m0, P.mag_lo, P.mag_hi);         // field strength must look like the usual field
+        m0 += (n - m0) * k;
+        V3 u = m * (1.f / n);
+        float wdip = 1.f;
+        if (inited) {                                               // angle between field and gravity must stay put (dip)
+            float c = dot(u, up_in_dev(q));
+            if (!c0_ok) { c0 = c; c0_ok = true; }
+            wdip = ramp(fabsf(c - c0), P.dip_lo, P.dip_hi);
+            c0 += (c - c0) * k;
         }
-        double s = std::sin(0.5 * ang) / ang;
-        out[0] = std::cos(0.5 * ang);
-        out[1] = s * x; out[2] = s * y; out[3] = s * z;
+        wm = wmag * wdip; um = u; have_m = true;
     }
 
-    static void toMatrix(const double q[4], double m[9]) {
-        double w_ = q[0], x = q[1], y = q[2], z = q[3];
-        m[0] = 1 - 2 * (y * y + z * z); m[1] = 2 * (x * y - z * w_);     m[2] = 2 * (x * z + y * w_);
-        m[3] = 2 * (x * y + z * w_);     m[4] = 1 - 2 * (x * x + z * z); m[5] = 2 * (y * z - x * w_);
-        m[6] = 2 * (x * z - y * w_);     m[7] = 2 * (y * z + x * w_);     m[8] = 1 - 2 * (x * x + y * y);
+    // Angular velocity (rad/s, device frame, right-hand rule) over (previous sample, t]. Call once per gyro event.
+    V3 sample(int64_t t) {
+        advance(t);
+        if (!inited) return {0.f, 0.f, 0.f};
+        float dt = (t_last - t_out) * 1e-9f;
+        if (dt < 1e-6f) return last_out;
+        last_out = qlog(qmul(qconj(q_out), q)) * (1.f / dt);
+        q_out = q; t_out = t_last;
+        return last_out;
     }
 
-    static void matrixToQ(const double m[9], double out[4]) {
-        double tr = m[0] + m[4] + m[8];
-        if (tr > 0) {
-            double s = std::sqrt(tr + 1.0) * 2;
-            out[0] = 0.25 * s; out[1] = (m[7] - m[5]) / s; out[2] = (m[2] - m[6]) / s; out[3] = (m[3] - m[1]) / s;
-        } else if (m[0] > m[4] && m[0] > m[8]) {
-            double s = std::sqrt(1.0 + m[0] - m[4] - m[8]) * 2;
-            out[0] = (m[7] - m[5]) / s; out[1] = 0.25 * s; out[2] = (m[1] + m[3]) / s; out[3] = (m[2] + m[6]) / s;
-        } else if (m[4] > m[8]) {
-            double s = std::sqrt(1.0 + m[4] - m[0] - m[8]) * 2;
-            out[0] = (m[2] - m[6]) / s; out[1] = (m[1] + m[3]) / s; out[2] = 0.25 * s; out[3] = (m[5] + m[7]) / s;
-        } else {
-            double s = std::sqrt(1.0 + m[8] - m[0] - m[4]) * 2;
-            out[0] = (m[3] - m[1]) / s; out[1] = (m[2] + m[6]) / s; out[2] = (m[5] + m[7]) / s; out[3] = 0.25 * s;
-        }
+    float tilt_trust() const { return wa; }
+    float yaw_trust()  const { return wm; }
+    Quat  attitude()   const { return q; }
+
+private:
+    Params P;
+    Quat q, q_out; V3 w, last_out, ua, um;
+    bool have_a, have_m, inited, c0_ok;
+    int64_t t_last, t_out, ta, tm;
+    float wa, wm, g0, m0, c0; int mcount;
+
+    void init_attitude(int64_t t) {
+        V3 h = um - ua * dot(um, ua); float hn = len(h);
+        if (hn < 0.05f) return;                                     // field parallel to gravity: heading undefined
+        V3 n = h * (1.f / hn);
+        q = quat_from_rows(n, cross(ua, n), ua);                    // rows: north, west, up
+        w = {0.f, 0.f, 0.f}; q_out = q; t_last = t_out = t; inited = true; last_out = {0.f, 0.f, 0.f};
+        c0 = dot(um, ua); c0_ok = true;                             // field/gravity angle at start = the reference
     }
 
-    // ------------------------------------------------------------------ internals
-    void correct(double ex, double ey, double ez, double alpha, double beta, double T) {
-        double exp_q[4], tmp_q[4];
-        qExp(alpha * ex, alpha * ey, alpha * ez, exp_q);
-        qMul(q, exp_q, tmp_q);
-        q[0] = tmp_q[0]; q[1] = tmp_q[1]; q[2] = tmp_q[2]; q[3] = tmp_q[3];
-        qNormalize(q);
-        double k = beta / T;
-        w[0] += k * ex; w[1] += k * ey; w[2] += k * ez;
+    void advance(int64_t t) {
+        if (!inited) { if (have_a && have_m) init_attitude(t); return; }
+        if (t <= t_last) return;
+        float dt = (t - t_last) * 1e-9f;
+        if (dt > P.max_gap) { inited = false; have_a = have_m = c0_ok = false; mcount = 0; return; }   // restart after a pause
+        int n = (int)ceilf(dt / 0.0025f); float h = dt / n;
+        for (int i = 0; i < n; i++) step(h, t_last + (int64_t)((i + 1) * h * 1e9f));
+        t_last = t;
     }
 
-    void decay(double gx, double gy, double gz, double T, bool along) {
-        double k = std::exp(-T / outageTau);
-        double d = w[0] * gx + w[1] * gy + w[2] * gz;
-        double px = d * gx, py = d * gy, pz = d * gz;               
-        if (along) {
-            w[0] = px * k + (w[0] - px); w[1] = py * k + (w[1] - py); w[2] = pz * k + (w[2] - pz);
-        } else {
-            w[0] = px + k * (w[0] - px); w[1] = py + k * (w[1] - py); w[2] = pz + k * (w[2] - pz);
-        }
-    }
-
-    void advance(double ts) {
-        double dt = ts - t;
-        if (!(dt > 0)) return;
-        
-        // FIX: Relaxed from 0.25 to 1.0 to prevent minor game engine stutters from constantly killing the gyro
-        if (dt > 1.0) {                                            
-            w[0] = w[1] = w[2] = 0.0;
-        } else {
-            double exp_q[4], tmp_q[4];
-            qExp(w[0] * dt, w[1] * dt, w[2] * dt, exp_q);
-            qMul(q, exp_q, tmp_q);
-            q[0] = tmp_q[0]; q[1] = tmp_q[1]; q[2] = tmp_q[2]; q[3] = tmp_q[3];
-            qNormalize(q);
-        }
-        t = ts;
-    }
-
-    void tryInit() {
-        if (!haveA || !haveM) return;
-        double an = std::sqrt(a0[0]*a0[0] + a0[1]*a0[1] + a0[2]*a0[2]);
-        double ux = a0[0]/an, uy = a0[1]/an, uz = a0[2]/an;
-        double ex = m0[1]*a0[2] - m0[2]*a0[1];
-        double ey = m0[2]*a0[0] - m0[0]*a0[2];
-        double ez = m0[0]*a0[1] - m0[1]*a0[0];
-        double en = std::sqrt(ex*ex + ey*ey + ez*ez);
-        if (en < 1e-9) return;                                      
-        ex /= en; ey /= en; ez /= en;
-        double nx = uy*ez - uz*ey, ny = uz*ex - ux*ez, nz = ux*ey - uy*ex;
-        double M[9] = {ex, ey, ez, nx, ny, nz, ux, uy, uz};
-        matrixToQ(M, q);
-        qNormalize(q);
-        t = std::fmax(ta0, tm0);
-        double mn = std::sqrt(m0[0]*m0[0] + m0[1]*m0[1] + m0[2]*m0[2]);
-        mRef = mn;
-        
-        // FIX: The NaN Assassin. Clamping the dot product prevents std::acos from returning NaN 
-        // due to 1.0000001 floating point inaccuracies, which would permanently kill the engine.
-        double dot_val = (m0[0]*a0[0] + m0[1]*a0[1] + m0[2]*a0[2]) / (mn * an);
-        dot_val = std::fmax(-1.0, std::fmin(1.0, dot_val));
-        dipRef = std::acos(dot_val);
-        
-        hRefX = 0.0; hRefY = 1.0;                                   
-        is_init = true;
-    }
-
-    // ------------------------------------------------------------------ inputs
-    void onAccel(double ts, double ax, double ay, double az) {
-        if (!is_init) {
-            a0[0] = ax; a0[1] = ay; a0[2] = az; ta0 = ts; haveA = true;
-            tryInit();
-            return;
-        }
-        double T = interval(ts, tAcc);
-        tAcc = ts;
-        advance(ts);
-        double n = std::sqrt(ax * ax + ay * ay + az * az);
-        if (n < 1e-3) return;                                       
-        toMatrix(q, R);
-        double gx = R[6], gy = R[7], gz = R[8];                     
-        double e[3];
-        rotvecBetween(ax / n, ay / n, az / n, gx, gy, gz, e);
-        double wgt = softGate(std::abs(n - G), gTol);
-        if (wgt < 0.02) {                                           
-            decay(gx, gy, gz, T, false);
-            return;
-        }
-        double gains[2];
-        trackingGains(T, sigmaTilt / std::sqrt(wgt), handAcc, gains);
-        correct(e[0], e[1], e[2], gains[0], gains[1], T);
-    }
-
-    void onMag(double ts, double mx, double my, double mz) {
-        if (!is_init) {
-            m0[0] = mx; m0[1] = my; m0[2] = mz; tm0 = ts; haveM = true;
-            tryInit();
-            return;
-        }
-        double T = interval(ts, tMag);
-        tMag = ts;
-        advance(ts);
-        double nm = std::sqrt(mx * mx + my * my + mz * mz);
-        if (nm < 1e-3) return;
-        toMatrix(q, R);
-        double gx = R[6], gy = R[7], gz = R[8];
-        double hx = R[0] * mx + R[1] * my + R[2] * mz;              
-        double hy = R[3] * mx + R[4] * my + R[5] * mz;              
-        double hn = std::sqrt(hx * hx + hy * hy);
-        double c = (mx * gx + my * gy + mz * gz) / nm;
-        
-        // Safety clamp for dip angle calculation
-        double dip = std::acos(std::fmax(-1.0, std::fmin(1.0, c)));
-        
-        double wgt = softGate(std::abs(nm - mRef) / mRef, magTol) * softGate(std::abs(dip - dipRef), dipTol);
-        if (hn < 0.2 * nm) wgt = 0.0;                               
-        double psi = 0.0;
-        if (wgt >= 0.02) {
-            psi = std::atan2(hx * hRefY - hy * hRefX, hx * hRefX + hy * hRefY);
-            if (std::abs(psi) > jumpReject) wgt = 0.0;              
-        }
-        if (wgt < 0.02) {
-            rejectT += T;
-            if (rejectT > 0.5 && hn >= 0.2 * nm) {                  
-                hRefX = hx / hn; hRefY = hy / hn;
-                mRef = nm; dipRef = dip; rejectT = 0.0;
-            }
-            decay(gx, gy, gz, T, true);                             
-            return;
-        }
-        rejectT = 0.0;
-        double gains[2];
-        trackingGains(T, sigmaHead / std::sqrt(wgt), handAcc, gains);
-        correct(psi * gx, psi * gy, psi * gz, gains[0], gains[1], T);   
-        if (wgt > 0.9) {                                            
-            double k = std::fmin(1.0, T / 20.0);
-            mRef += k * (nm - mRef);
-            dipRef += k * (dip - dipRef);
-        }
-    }
-
-    // ------------------------------------------------------------------ outputs
-    void getRate(float out[3]) {
-        if (!is_init) { out[0] = out[1] = out[2] = 0.0f; return; }
-        double n = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
-        
-        // Deadzone removed for 1:1 hardware translation
-        if (n <= deadzone) { out[0] = out[1] = out[2] = 0.0f; return; }
-        double s = 1.0; 
-        
-        out[0] = (float)(w[0] * s);
-        out[1] = (float)(w[1] * s);
-        out[2] = (float)(w[2] * s);
+    void step(float h, int64_t t_now) {
+        V3 up = up_in_dev(q), north = north_in_dev(q);
+        float wa_e = (have_a && (t_now - ta) * 1e-9f < P.stale) ? wa : 0.f;
+        float wm_e = (have_m && (t_now - tm) * 1e-9f < P.stale) ? wm : 0.f;
+        V3 e_tilt = cross(ua, up) * wa_e;                           // lies in the plane perpendicular to gravity
+        V3 e_yaw = {0.f, 0.f, 0.f};
+        V3 hm = um - up * dot(um, up); float hn = len(hm);          // horizontal part of the measured field
+        if (hn > 0.1f && wm_e > 0.f) e_yaw = cross(hm * (1.f / hn), north) * wm_e;   // parallel to gravity
+        const float wt = 6.2831853f * P.tilt_hz, wy = 6.2831853f * P.yaw_hz;
+        const float kp_t = 2.f * P.damping * wt, ki_t = wt * wt, kp_y = 2.f * P.damping * wy, ki_y = wy * wy;
+        w = w + (e_tilt * ki_t + e_yaw * ki_y - w * (1.f / P.leak_s)) * h;
+        float wl = len(w); if (wl > P.max_rate) w = w * (P.max_rate / wl);
+        V3 w_eff = w + e_tilt * kp_t + e_yaw * kp_y;
+        q = qnorm(qmul(q, qexp(w_eff * h)));
     }
 };
 
-// --- GLOBAL INSTANCE & CONFIG ---
-static VirtualGyro vgyro;
-static const float HARD_IRON_X = 93.76f;
+}  // namespace gl
+
+// ---- hook: single pass, events in timestamp order ----
+static const float HARD_IRON_X = 93.76f;      // your magnetometer offsets (uT)
 static const float HARD_IRON_Y = -29.09f;
 static const float HARD_IRON_Z = 967.01f;
+
+static gl::VirtualGyro vg;                    // default tuning lives in gl::Params
+static std::mutex vg_lock;                    // the game may call getEvents from more than one thread
 
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
 static getEvents_t orig_getEvents = nullptr;
@@ -281,33 +213,18 @@ static getEvents_t orig_getEvents = nullptr;
 ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent* events, size_t count) {
     ssize_t n = orig_getEvents(queue, events, count);
     if (n <= 0) return n;
-
-    // PASS 1: Feed the Kalman Engine
+    std::lock_guard<std::mutex> lock(vg_lock);
     for (ssize_t i = 0; i < n; i++) {
-        if (events[i].timestamp <= 0) continue; // Skip corrupt events
-        double ts_sec = (double)events[i].timestamp / 1000000000.0; 
-        
-        if (events[i].type == ASENSOR_TYPE_ACCELEROMETER) {
-            vgyro.onAccel(ts_sec, events[i].acceleration.x, events[i].acceleration.y, events[i].acceleration.z);
-        } 
-        else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || events[i].type == 14) {
-            float mx = events[i].uncalibrated_magnetic.x_uncalib - HARD_IRON_X;
-            float my = events[i].uncalibrated_magnetic.y_uncalib - HARD_IRON_Y;
-            float mz = events[i].uncalibrated_magnetic.z_uncalib - HARD_IRON_Z;
-            vgyro.onMag(ts_sec, mx, my, mz);
-        }
-    }
-
-    // PASS 2: Output flawless true hardware velocity to the Gyro
-    for (ssize_t i = 0; i < n; i++) {                          
-        if (events[i].type == ASENSOR_TYPE_GYROSCOPE || events[i].type == 4 || events[i].type == 16) {
-            float rate[3] = {0.0f, 0.0f, 0.0f};
-            vgyro.getRate(rate);
-            
-            // Output to the native gyro fields
-            events[i].gyro.x = rate[0];
-            events[i].gyro.y = rate[1];
-            events[i].gyro.z = rate[2]; 
+        ASensorEvent& e = events[i];
+        if (e.type == ASENSOR_TYPE_ACCELEROMETER) {
+            vg.onAccel({e.acceleration.x, e.acceleration.y, e.acceleration.z}, e.timestamp);
+        } else if (e.type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || e.type == 14) {
+            vg.onMag({e.uncalibrated_magnetic.x_uncalib - HARD_IRON_X,
+                      e.uncalibrated_magnetic.y_uncalib - HARD_IRON_Y,
+                      e.uncalibrated_magnetic.z_uncalib - HARD_IRON_Z}, e.timestamp);
+        } else if (e.type == ASENSOR_TYPE_GYROSCOPE || e.type == 4 || e.type == 16) {
+            gl::V3 w = vg.sample(e.timestamp);          // rotation of the attitude since the previous gyro sample
+            e.vector.x = w.x; e.vector.y = w.y; e.vector.z = w.z;
         }
     }
     return n;
@@ -317,7 +234,7 @@ typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
 static setEventRate_t orig_setEventRate = nullptr;
 
 int hook_ASensorEventQueue_setEventRate(ASensorEventQueue* queue, ASensor const* sensor, int32_t usec) {
-    return orig_setEventRate(queue, sensor, 0);
+    return orig_setEventRate(queue, sensor, 0);      // ask for the fastest rate (Android 12+ may cap it without HIGH_SAMPLING_RATE_SENSORS)
 }
 
 void install_hook() {
@@ -336,7 +253,10 @@ public:
     void preAppSpecialize(zygisk::AppSpecializeArgs* args) override {
         const char* process = env->GetStringUTFChars(args->nice_name, nullptr);
         if (process) {
-            if (strcmp(process, "com.activision.callofduty.shooter") == 0) { enable_hack = true; }
+            static const char* const targets[] = { "com.activision.callofduty.shooter",   // CODM
+                                                   "com.tencent.ig",                       // PUBG Mobile
+                                                   "com.pubg.imobile" };                   // BGMI
+            for (const char* t : targets) if (strcmp(process, t) == 0) enable_hack = true;
             env->ReleaseStringUTFChars(args->nice_name, process);
         }
     }
