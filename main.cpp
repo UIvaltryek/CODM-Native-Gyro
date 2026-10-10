@@ -13,16 +13,16 @@ class VirtualGyro {
 public:
     static constexpr double G = 9.80665;
 
-    // ---- TUNING (Direct from Java source) ----
+    // ---- TUNING ----
     double sigmaTilt = 0.03;                    
     double sigmaHead = 0.03;                    
     double handAcc = 12.0;                      
     double gTol = 2.0;                          
     double magTol = 0.15;                       
     double dipTol = 8.0 * M_PI / 180.0;         
-    double jumpReject = 30.0 * M_PI / 180.0;    
+    double jumpReject = 90.0 * M_PI / 180.0;    // Relaxed to prevent compass rejection locks
     double outageTau = 0.15;                    
-    double deadzone = 1.5 * M_PI / 180.0;       
+    double deadzone = 0.0;                      // Completely removed to ensure micro-aiming passes through
 
     // ---- STATE ----
     bool is_init = false;
@@ -138,7 +138,9 @@ public:
     void advance(double ts) {
         double dt = ts - t;
         if (!(dt > 0)) return;
-        if (dt > 0.25) {                                            
+        
+        // FIX: Relaxed from 0.25 to 1.0 to prevent minor game engine stutters from constantly killing the gyro
+        if (dt > 1.0) {                                            
             w[0] = w[1] = w[2] = 0.0;
         } else {
             double exp_q[4], tmp_q[4];
@@ -167,7 +169,13 @@ public:
         t = std::fmax(ta0, tm0);
         double mn = std::sqrt(m0[0]*m0[0] + m0[1]*m0[1] + m0[2]*m0[2]);
         mRef = mn;
-        dipRef = std::acos((m0[0]*a0[0] + m0[1]*a0[1] + m0[2]*a0[2]) / (mn * an));
+        
+        // FIX: The NaN Assassin. Clamping the dot product prevents std::acos from returning NaN 
+        // due to 1.0000001 floating point inaccuracies, which would permanently kill the engine.
+        double dot_val = (m0[0]*a0[0] + m0[1]*a0[1] + m0[2]*a0[2]) / (mn * an);
+        dot_val = std::fmax(-1.0, std::fmin(1.0, dot_val));
+        dipRef = std::acos(dot_val);
+        
         hRefX = 0.0; hRefY = 1.0;                                   
         is_init = true;
     }
@@ -215,7 +223,10 @@ public:
         double hy = R[3] * mx + R[4] * my + R[5] * mz;              
         double hn = std::sqrt(hx * hx + hy * hy);
         double c = (mx * gx + my * gy + mz * gz) / nm;
+        
+        // Safety clamp for dip angle calculation
         double dip = std::acos(std::fmax(-1.0, std::fmin(1.0, c)));
+        
         double wgt = softGate(std::abs(nm - mRef) / mRef, magTol) * softGate(std::abs(dip - dipRef), dipTol);
         if (hn < 0.2 * nm) wgt = 0.0;                               
         double psi = 0.0;
@@ -247,8 +258,11 @@ public:
     void getRate(float out[3]) {
         if (!is_init) { out[0] = out[1] = out[2] = 0.0f; return; }
         double n = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+        
+        // Deadzone removed for 1:1 hardware translation
         if (n <= deadzone) { out[0] = out[1] = out[2] = 0.0f; return; }
-        double s = 1.0 - deadzone / n;
+        double s = 1.0; 
+        
         out[0] = (float)(w[0] * s);
         out[1] = (float)(w[1] * s);
         out[2] = (float)(w[2] * s);
@@ -268,14 +282,14 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
     ssize_t n = orig_getEvents(queue, events, count);
     if (n <= 0) return n;
 
-    // PASS 1: Feed the Kalman Engine as events arrive natively
-    for (ssize_t i = 0; i < n; i++) {                          
-        double ts_sec = events[i].timestamp / 1e9; // Convert nano to sec for engine
+    // PASS 1: Feed the Kalman Engine
+    for (ssize_t i = 0; i < n; i++) {
+        if (events[i].timestamp <= 0) continue; // Skip corrupt events
+        double ts_sec = (double)events[i].timestamp / 1000000000.0; 
         
         if (events[i].type == ASENSOR_TYPE_ACCELEROMETER) {
             vgyro.onAccel(ts_sec, events[i].acceleration.x, events[i].acceleration.y, events[i].acceleration.z);
         } 
-        // Feed Uncalibrated Mag with your Custom Hard-Iron subtraction
         else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || events[i].type == 14) {
             float mx = events[i].uncalibrated_magnetic.x_uncalib - HARD_IRON_X;
             float my = events[i].uncalibrated_magnetic.y_uncalib - HARD_IRON_Y;
@@ -287,13 +301,13 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
     // PASS 2: Output flawless true hardware velocity to the Gyro
     for (ssize_t i = 0; i < n; i++) {                          
         if (events[i].type == ASENSOR_TYPE_GYROSCOPE || events[i].type == 4 || events[i].type == 16) {
-            float rate[3];
+            float rate[3] = {0.0f, 0.0f, 0.0f};
             vgyro.getRate(rate);
             
-            // True 3D velocity mapping; Android Display framework rotates it automatically for CODM
-            events[i].vector.x = rate[0];
-            events[i].vector.y = rate[1];
-            events[i].vector.z = rate[2]; 
+            // Output to the native gyro fields
+            events[i].gyro.x = rate[0];
+            events[i].gyro.y = rate[1];
+            events[i].gyro.z = rate[2]; 
         }
     }
     return n;
