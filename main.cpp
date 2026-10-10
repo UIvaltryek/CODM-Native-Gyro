@@ -1,196 +1,299 @@
 #include <android/sensor.h>
 #include <dlfcn.h>
 #include <string.h>
-#include <math.h>
+#include <cmath>
 #include "dobby.h"
 #include "zygisk.hpp"
 
-// Virtual gyro for devices without one: accelerometer (gravity) + magnetometer (heading) -> angular velocity,
-// then a Mahony AHRS pass that keeps long-term drift bounded.
-//
-// Sensor events are always in the device's natural frame (portrait on a phone); the game does the landscape
-// remap itself[span_14](start_span)[span_14](end_span). So we just output the true 3D angular velocity there - orientation independent[span_15](start_span)[span_15](end_span).
-//
-//   w_perp (tilt)  = -(g_prev x g_now) / dt                       (g = unit "up" from the accelerometer)[span_16](start_span)[span_16](end_span)
-//   w_yaw  (turn)  = -((h_prev x h_now) . g) / dt                 (h = unit horizontal magnetic direction)[span_17](start_span)[span_17](end_span)
-//   w              = w_perp + w_yaw * g
+// VirtualGyro - Ported to C++ for Zygisk
+// Pure Kalman-style tracking filter. Zero Euler angles. Zero Gimbal Lock.
+// Natively outputs true 3D hardware velocity; the game handles display rotation remap natively.
 
-static const float Kp = 1.5f;
+class VirtualGyro {
+public:
+    static constexpr double G = 9.80665;
+
+    // ---- TUNING (Direct from Java source) ----
+    double sigmaTilt = 0.03;                    
+    double sigmaHead = 0.03;                    
+    double handAcc = 12.0;                      
+    double gTol = 2.0;                          
+    double magTol = 0.15;                       
+    double dipTol = 8.0 * M_PI / 180.0;         
+    double jumpReject = 30.0 * M_PI / 180.0;    
+    double outageTau = 0.15;                    
+    double deadzone = 1.5 * M_PI / 180.0;       
+
+    // ---- STATE ----
+    bool is_init = false;
+    double q[4] = {1.0, 0.0, 0.0, 0.0};         
+    double w[3] = {0.0, 0.0, 0.0};              
+    double t = NAN;
+    bool haveA = false, haveM = false;
+    double ta0 = NAN, tm0 = NAN;
+    double a0[3] = {0}, m0[3] = {0};
+    double tAcc = NAN, tMag = NAN;
+    double mRef = 0, dipRef = 0;
+    double hRefX = 0.0, hRefY = 1.0;
+    double rejectT = 0.0;
+    double R[9] = {0};                          
+
+    // ------------------------------------------------------------------ helpers
+    static double interval(double ts, double prev) {
+        return std::isnan(prev) ? 0.01 : std::fmin(0.1, std::fmax(1e-3, ts - prev));
+    }
+
+    static double softGate(double dev, double tol) {
+        double x = dev / tol;
+        return x >= 1.0 ? 0.0 : 1.0 - x * x;
+    }
+
+    static void trackingGains(double T, double sigmaMeas, double sigmaAcc, double out[2]) {
+        double lam = sigmaAcc * T * T / sigmaMeas;
+        double r = (4.0 + lam - std::sqrt(8.0 * lam + lam * lam)) / 4.0;
+        double alpha = 1.0 - r * r;
+        double beta = 2.0 * (2.0 - alpha) - 4.0 * r;
+        out[0] = std::fmin(alpha, 0.9);
+        out[1] = std::fmin(std::fmax(beta, 0.0), 0.8);
+    }
+
+    static void rotvecBetween(double ux, double uy, double uz, double vx, double vy, double vz, double out[3]) {
+        double cx = uy * vz - uz * vy, cy = uz * vx - ux * vz, cz = ux * vy - uy * vx;
+        double s = std::sqrt(cx * cx + cy * cy + cz * cz);
+        if (s < 1e-12) { out[0] = out[1] = out[2] = 0.0; return; }
+        double k = std::atan2(s, ux * vx + uy * vy + uz * vz) / s;
+        out[0] = cx * k; out[1] = cy * k; out[2] = cz * k;
+    }
+
+    static void qMul(const double a[4], const double b[4], double out[4]) {
+        out[0] = a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3];
+        out[1] = a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2];
+        out[2] = a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1];
+        out[3] = a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0];
+    }
+
+    static void qNormalize(double q[4]) {
+        double n = std::sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
+        if(n > 1e-9) { q[0] /= n; q[1] /= n; q[2] /= n; q[3] /= n; }
+    }
+
+    static void qExp(double x, double y, double z, double out[4]) {
+        double ang = std::sqrt(x * x + y * y + z * z);
+        if (ang < 1e-9) {
+            out[0] = 1.0; out[1] = 0.5 * x; out[2] = 0.5 * y; out[3] = 0.5 * z;
+            qNormalize(out);
+            return;
+        }
+        double s = std::sin(0.5 * ang) / ang;
+        out[0] = std::cos(0.5 * ang);
+        out[1] = s * x; out[2] = s * y; out[3] = s * z;
+    }
+
+    static void toMatrix(const double q[4], double m[9]) {
+        double w_ = q[0], x = q[1], y = q[2], z = q[3];
+        m[0] = 1 - 2 * (y * y + z * z); m[1] = 2 * (x * y - z * w_);     m[2] = 2 * (x * z + y * w_);
+        m[3] = 2 * (x * y + z * w_);     m[4] = 1 - 2 * (x * x + z * z); m[5] = 2 * (y * z - x * w_);
+        m[6] = 2 * (x * z - y * w_);     m[7] = 2 * (y * z + x * w_);     m[8] = 1 - 2 * (x * x + y * y);
+    }
+
+    static void matrixToQ(const double m[9], double out[4]) {
+        double tr = m[0] + m[4] + m[8];
+        if (tr > 0) {
+            double s = std::sqrt(tr + 1.0) * 2;
+            out[0] = 0.25 * s; out[1] = (m[7] - m[5]) / s; out[2] = (m[2] - m[6]) / s; out[3] = (m[3] - m[1]) / s;
+        } else if (m[0] > m[4] && m[0] > m[8]) {
+            double s = std::sqrt(1.0 + m[0] - m[4] - m[8]) * 2;
+            out[0] = (m[7] - m[5]) / s; out[1] = 0.25 * s; out[2] = (m[1] + m[3]) / s; out[3] = (m[2] + m[6]) / s;
+        } else if (m[4] > m[8]) {
+            double s = std::sqrt(1.0 + m[4] - m[0] - m[8]) * 2;
+            out[0] = (m[2] - m[6]) / s; out[1] = (m[1] + m[3]) / s; out[2] = 0.25 * s; out[3] = (m[5] + m[7]) / s;
+        } else {
+            double s = std::sqrt(1.0 + m[8] - m[0] - m[4]) * 2;
+            out[0] = (m[3] - m[1]) / s; out[1] = (m[2] + m[6]) / s; out[2] = (m[5] + m[7]) / s; out[3] = 0.25 * s;
+        }
+    }
+
+    // ------------------------------------------------------------------ internals
+    void correct(double ex, double ey, double ez, double alpha, double beta, double T) {
+        double exp_q[4], tmp_q[4];
+        qExp(alpha * ex, alpha * ey, alpha * ez, exp_q);
+        qMul(q, exp_q, tmp_q);
+        q[0] = tmp_q[0]; q[1] = tmp_q[1]; q[2] = tmp_q[2]; q[3] = tmp_q[3];
+        qNormalize(q);
+        double k = beta / T;
+        w[0] += k * ex; w[1] += k * ey; w[2] += k * ez;
+    }
+
+    void decay(double gx, double gy, double gz, double T, bool along) {
+        double k = std::exp(-T / outageTau);
+        double d = w[0] * gx + w[1] * gy + w[2] * gz;
+        double px = d * gx, py = d * gy, pz = d * gz;               
+        if (along) {
+            w[0] = px * k + (w[0] - px); w[1] = py * k + (w[1] - py); w[2] = pz * k + (w[2] - pz);
+        } else {
+            w[0] = px + k * (w[0] - px); w[1] = py + k * (w[1] - py); w[2] = pz + k * (w[2] - pz);
+        }
+    }
+
+    void advance(double ts) {
+        double dt = ts - t;
+        if (!(dt > 0)) return;
+        if (dt > 0.25) {                                            
+            w[0] = w[1] = w[2] = 0.0;
+        } else {
+            double exp_q[4], tmp_q[4];
+            qExp(w[0] * dt, w[1] * dt, w[2] * dt, exp_q);
+            qMul(q, exp_q, tmp_q);
+            q[0] = tmp_q[0]; q[1] = tmp_q[1]; q[2] = tmp_q[2]; q[3] = tmp_q[3];
+            qNormalize(q);
+        }
+        t = ts;
+    }
+
+    void tryInit() {
+        if (!haveA || !haveM) return;
+        double an = std::sqrt(a0[0]*a0[0] + a0[1]*a0[1] + a0[2]*a0[2]);
+        double ux = a0[0]/an, uy = a0[1]/an, uz = a0[2]/an;
+        double ex = m0[1]*a0[2] - m0[2]*a0[1];
+        double ey = m0[2]*a0[0] - m0[0]*a0[2];
+        double ez = m0[0]*a0[1] - m0[1]*a0[0];
+        double en = std::sqrt(ex*ex + ey*ey + ez*ez);
+        if (en < 1e-9) return;                                      
+        ex /= en; ey /= en; ez /= en;
+        double nx = uy*ez - uz*ey, ny = uz*ex - ux*ez, nz = ux*ey - uy*ex;
+        double M[9] = {ex, ey, ez, nx, ny, nz, ux, uy, uz};
+        matrixToQ(M, q);
+        qNormalize(q);
+        t = std::fmax(ta0, tm0);
+        double mn = std::sqrt(m0[0]*m0[0] + m0[1]*m0[1] + m0[2]*m0[2]);
+        mRef = mn;
+        dipRef = std::acos((m0[0]*a0[0] + m0[1]*a0[1] + m0[2]*a0[2]) / (mn * an));
+        hRefX = 0.0; hRefY = 1.0;                                   
+        is_init = true;
+    }
+
+    // ------------------------------------------------------------------ inputs
+    void onAccel(double ts, double ax, double ay, double az) {
+        if (!is_init) {
+            a0[0] = ax; a0[1] = ay; a0[2] = az; ta0 = ts; haveA = true;
+            tryInit();
+            return;
+        }
+        double T = interval(ts, tAcc);
+        tAcc = ts;
+        advance(ts);
+        double n = std::sqrt(ax * ax + ay * ay + az * az);
+        if (n < 1e-3) return;                                       
+        toMatrix(q, R);
+        double gx = R[6], gy = R[7], gz = R[8];                     
+        double e[3];
+        rotvecBetween(ax / n, ay / n, az / n, gx, gy, gz, e);
+        double wgt = softGate(std::abs(n - G), gTol);
+        if (wgt < 0.02) {                                           
+            decay(gx, gy, gz, T, false);
+            return;
+        }
+        double gains[2];
+        trackingGains(T, sigmaTilt / std::sqrt(wgt), handAcc, gains);
+        correct(e[0], e[1], e[2], gains[0], gains[1], T);
+    }
+
+    void onMag(double ts, double mx, double my, double mz) {
+        if (!is_init) {
+            m0[0] = mx; m0[1] = my; m0[2] = mz; tm0 = ts; haveM = true;
+            tryInit();
+            return;
+        }
+        double T = interval(ts, tMag);
+        tMag = ts;
+        advance(ts);
+        double nm = std::sqrt(mx * mx + my * my + mz * mz);
+        if (nm < 1e-3) return;
+        toMatrix(q, R);
+        double gx = R[6], gy = R[7], gz = R[8];
+        double hx = R[0] * mx + R[1] * my + R[2] * mz;              
+        double hy = R[3] * mx + R[4] * my + R[5] * mz;              
+        double hn = std::sqrt(hx * hx + hy * hy);
+        double c = (mx * gx + my * gy + mz * gz) / nm;
+        double dip = std::acos(std::fmax(-1.0, std::fmin(1.0, c)));
+        double wgt = softGate(std::abs(nm - mRef) / mRef, magTol) * softGate(std::abs(dip - dipRef), dipTol);
+        if (hn < 0.2 * nm) wgt = 0.0;                               
+        double psi = 0.0;
+        if (wgt >= 0.02) {
+            psi = std::atan2(hx * hRefY - hy * hRefX, hx * hRefX + hy * hRefY);
+            if (std::abs(psi) > jumpReject) wgt = 0.0;              
+        }
+        if (wgt < 0.02) {
+            rejectT += T;
+            if (rejectT > 0.5 && hn >= 0.2 * nm) {                  
+                hRefX = hx / hn; hRefY = hy / hn;
+                mRef = nm; dipRef = dip; rejectT = 0.0;
+            }
+            decay(gx, gy, gz, T, true);                             
+            return;
+        }
+        rejectT = 0.0;
+        double gains[2];
+        trackingGains(T, sigmaHead / std::sqrt(wgt), handAcc, gains);
+        correct(psi * gx, psi * gy, psi * gz, gains[0], gains[1], T);   
+        if (wgt > 0.9) {                                            
+            double k = std::fmin(1.0, T / 20.0);
+            mRef += k * (nm - mRef);
+            dipRef += k * (dip - dipRef);
+        }
+    }
+
+    // ------------------------------------------------------------------ outputs
+    void getRate(float out[3]) {
+        if (!is_init) { out[0] = out[1] = out[2] = 0.0f; return; }
+        double n = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+        if (n <= deadzone) { out[0] = out[1] = out[2] = 0.0f; return; }
+        double s = 1.0 - deadzone / n;
+        out[0] = (float)(w[0] * s);
+        out[1] = (float)(w[1] * s);
+        out[2] = (float)(w[2] * s);
+    }
+};
+
+// --- GLOBAL INSTANCE & CONFIG ---
+static VirtualGyro vgyro;
 static const float HARD_IRON_X = 93.76f;
 static const float HARD_IRON_Y = -29.09f;
 static const float HARD_IRON_Z = 967.01f;
-static const int64_t MIN_SPAN_NS = 8000000;   // minimum baseline for differencing (5-10 ms); shorter = less lag, more jitter[span_18](start_span)[span_18](end_span)
 
-static float final_gyro[3] = {0.0f, 0.0f, 0.0f};
-static float last_accel[3] = {0.0f, 0.0f, 9.81f};
-static float last_mag[3]   = {0.0f, 1.0f, 0.0f};
-static float cur_g[3]      = {0.0f, 0.0f, 1.0f};   // latest unit "up" vector (device frame)
-static float ref_g[3], ref_h[3];                   // reference samples we difference against
-static int64_t ref_g_ts = 0, ref_h_ts = 0, last_fuse_ts = 0;
-static float tilt_w[3] = {0.0f, 0.0f, 0.0f};       // angular rate perpendicular to gravity
-static float yaw_w = 0.0f;                         // angular rate about gravity
-static bool seeded = false;
-static float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
 static getEvents_t orig_getEvents = nullptr;
-
-void cross_product(float a[3], float b[3], float out[3]) {
-    out[0] = a[1]*b[2] - a[2]*b[1];
-    out[1] = a[2]*b[0] - a[0]*b[2];
-    out[2] = a[0]*b[1] - a[1]*b[0];
-}
-
-void normalize(float v[3]) {
-    float norm = sqrtf(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
-    if (norm > 0.0001f) { v[0]/=norm; v[1]/=norm; v[2]/=norm; }
-}
-
-void seed_mahony(float ax, float ay, float az, float mx, float my, float mz) {
-    float A[3] = {ax, ay, az}; normalize(A);
-    float M[3] = {mx, my, mz}; normalize(M);
-    float E[3]; cross_product(M, A, E); normalize(E);
-    float N[3]; cross_product(A, E, N); normalize(N);
-    // Mahony's earth frame: x = magnetic north, y = WEST, z = up  ->  columns [N, -E, Up][span_19](start_span)[span_19](end_span)
-    float R[3][3] = { {N[0], -E[0], A[0]}, {N[1], -E[1], A[1]}, {N[2], -E[2], A[2]} };
-    float tr = R[0][0] + R[1][1] + R[2][2];
-    if (tr > 0.0f) {
-        float S = sqrtf(tr + 1.0f) * 2.0f;
-        q0 = 0.25f * S; q1 = (R[1][2] - R[2][1]) / S; q2 = (R[2][0] - R[0][2]) / S; q3 = (R[0][1] - R[1][0]) / S;
-    } else if ((R[0][0] > R[1][1]) && (R[0][0] > R[2][2])) {
-        float S = sqrtf(1.0f + R[0][0] - R[1][1] - R[2][2]) * 2.0f;
-        q0 = (R[1][2] - R[2][1]) / S; q1 = 0.25f * S; q2 = (R[0][1] + R[1][0]) / S; q3 = (R[2][0] + R[0][2]) / S;
-    } else if (R[1][1] > R[2][2]) {
-        float S = sqrtf(1.0f + R[1][1] - R[0][0] - R[2][2]) * 2.0f;
-        q0 = (R[2][0] - R[0][2]) / S; q1 = (R[0][1] + R[1][0]) / S; q2 = 0.25f * S; q3 = (R[1][2] + R[2][1]) / S;
-    } else {
-        float S = sqrtf(1.0f + R[2][2] - R[0][0] - R[1][1]) * 2.0f;
-        q0 = (R[0][1] - R[1][0]) / S; q1 = (R[2][0] + R[0][2]) / S; q2 = (R[1][2] + R[2][1]) / S; q3 = 0.25f * S;
-    }
-    float norm = sqrtf(q0*q0 + q1*q1 + q2*q2 + q3*q3);
-    if(norm > 0.0001f) { q0/=norm; q1/=norm; q2/=norm; q3/=norm; }
-}
-
-void MahonyAHRSupdate(float gx, float gy, float gz, float ax, float ay, float az, float mx, float my, float mz, float dt, float& out_gx, float& out_gy, float& out_gz) {
-    float recipNorm;
-    float q0q0, q0q1, q0q2, q0q3, q1q1, q1q2, q1q3, q2q2, q2q3, q3q3;
-    float hx, hy, bx, bz;
-    float halfvx, halfvy, halfvz, halfwx, halfwy, halfwz;
-    float halfex, halfey, halfez;
-    float qa, qb, qc;
-    if(!((ax == 0.0f) && (ay == 0.0f) && (az == 0.0f))) {
-        recipNorm = 1.0f / sqrtf(ax * ax + ay * ay + az * az);
-        ax *= recipNorm; ay *= recipNorm; az *= recipNorm;
-        recipNorm = 1.0f / sqrtf(mx * mx + my * my + mz * mz);
-        mx *= recipNorm; my *= recipNorm; mz *= recipNorm;
-        q0q0 = q0 * q0; q0q1 = q0 * q1; q0q2 = q0 * q2; q0q3 = q0 * q3;
-        q1q1 = q1 * q1; q1q2 = q1 * q2; q1q3 = q1 * q3;
-        q2q2 = q2 * q2; q2q3 = q2 * q3; q3q3 = q3 * q3;
-        hx = 2.0f * (mx * (0.5f - q2q2 - q3q3) + my * (q1q2 - q0q3) + mz * (q1q3 + q0q2));
-        hy = 2.0f * (mx * (q1q2 + q0q3) + my * (0.5f - q1q1 - q3q3) + mz * (q2q3 - q0q1));
-        bx = sqrtf(hx * hx + hy * hy);
-        bz = 2.0f * (mx * (q1q3 - q0q2) + my * (q2q3 + q0q1) + mz * (0.5f - q1q1 - q2q2));
-        halfvx = q1q3 - q0q2;
-        halfvy = q0q1 + q2q3;
-        halfvz = q0q0 - 0.5f + q3q3;
-        halfwx = bx * (0.5f - q2q2 - q3q3) + bz * (q1q3 - q0q2);
-        halfwy = bx * (q1q2 - q0q3) + bz * (q0q1 + q2q3);
-        halfwz = bx * (q0q2 + q1q3) + bz * (0.5f - q1q1 - q2q2);
-        halfex = (ay * halfvz - az * halfvy) + (my * halfwz - mz * halfwy);
-        halfey = (az * halfvx - ax * halfvz) + (mz * halfwx - mx * halfwz);
-        halfez = (ax * halfvy - ay * halfvx) + (mx * halfwy - my * halfwx);
-        gx += Kp * halfex; gy += Kp * halfey; gz += Kp * halfez;
-    }
-    out_gx = gx; out_gy = gy; out_gz = gz;
-    gx *= (0.5f * dt); gy *= (0.5f * dt); gz *= (0.5f * dt);
-    qa = q0; qb = q1; qc = q2;
-    q0 += (-qb * gx - qc * gy - q3 * gz);
-    q1 += (qa * gx + qc * gz - q3 * gy);
-    q2 += (qa * gy - qb * gz + q3 * gx);
-    q3 += (qa * gz + qb * gy - qc * gx);
-    recipNorm = 1.0f / sqrtf(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
-    q0 *= recipNorm; q1 *= recipNorm; q2 *= recipNorm; q3 *= recipNorm;
-}
-
-// ---------- event-driven fusion: every sensor is differenced against ITS OWN timestamps ----------
-static void fusion_reset() {
-    ref_g_ts = ref_h_ts = 0; seeded = false;
-    tilt_w[0] = tilt_w[1] = tilt_w[2] = 0.0f; yaw_w = 0.0f;
-    final_gyro[0] = final_gyro[1] = final_gyro[2] = 0.0f;
-}
-
-static void fusion_accel(const float a[3], int64_t ts) {
-    memcpy(last_accel, a, sizeof last_accel);
-    float G = sqrtf(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]); if (G < 0.1f) G = 0.1f;
-    float g[3] = { a[0]/G, a[1]/G, a[2]/G };
-    memcpy(cur_g, g, sizeof g);
-    if (ref_g_ts == 0) { memcpy(ref_g, g, sizeof g); ref_g_ts = ts; return; }
-    int64_t span = ts - ref_g_ts;
-    if (span < MIN_SPAN_NS) return;
-    float dt = span / 1e9f;
-    if (dt < 0.1f) {
-        float c[3]; cross_product(ref_g, g, c);               // w_perp = -(g_prev x g_now) / dt[span_20](start_span)[span_20](end_span)
-        for (int i = 0; i < 3; i++) tilt_w[i] = -c[i] / dt;
-    } else { tilt_w[0] = tilt_w[1] = tilt_w[2] = 0.0f; }
-    memcpy(ref_g, g, sizeof g); ref_g_ts = ts;
-}
-
-static void fusion_mag(const float m[3], int64_t ts) {
-    memcpy(last_mag, m, sizeof last_mag);
-    if (ref_g_ts == 0) return;                                  // need a gravity sample first
-    float d = m[0]*cur_g[0] + m[1]*cur_g[1] + m[2]*cur_g[2];
-    float h[3] = { m[0] - d*cur_g[0], m[1] - d*cur_g[1], m[2] - d*cur_g[2] };
-    float H = sqrtf(h[0]*h[0] + h[1]*h[1] + h[2]*h[2]);
-    if (H < 0.01f) return;
-    h[0] /= H; h[1] /= H; h[2] /= H;
-    if (ref_h_ts == 0) { memcpy(ref_h, h, sizeof h); ref_h_ts = ts; return; }
-    int64_t span = ts - ref_h_ts;
-    if (span < MIN_SPAN_NS) return;
-    float dt = span / 1e9f;
-    if (dt < 0.1f) {
-        float c[3]; cross_product(ref_h, h, c);               // rotation about gravity[span_21](start_span)[span_21](end_span)
-        yaw_w = -(c[0]*cur_g[0] + c[1]*cur_g[1] + c[2]*cur_g[2]) / dt;
-    } else { yaw_w = 0.0f; }
-    memcpy(ref_h, h, sizeof h); ref_h_ts = ts;
-}
-
-static void fusion_finish(int64_t ts) {
-    if (ref_g_ts == 0 || ref_h_ts == 0) return;
-    if (!seeded) {
-        seed_mahony(last_accel[0], last_accel[1], last_accel[2], last_mag[0], last_mag[1], last_mag[2]);
-        seeded = true; last_fuse_ts = ts; return;
-    }
-    float dt = (ts - last_fuse_ts) / 1e9f;
-    last_fuse_ts = ts;
-    if (dt <= 0.0f || dt > 0.1f) { fusion_reset(); return; }   // gap (app paused etc): start clean, re-seed[span_22](start_span)[span_22](end_span)
-    float w[3] = { tilt_w[0] + yaw_w*cur_g[0], tilt_w[1] + yaw_w*cur_g[1], tilt_w[2] + yaw_w*cur_g[2] };
-    MahonyAHRSupdate(w[0], w[1], w[2], last_accel[0], last_accel[1], last_accel[2],
-                     last_mag[0], last_mag[1], last_mag[2], dt, final_gyro[0], final_gyro[1], final_gyro[2]);
-}
 
 ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent* events, size_t count) {
     ssize_t n = orig_getEvents(queue, events, count);
     if (n <= 0) return n;
 
-    int64_t latest = 0;
-    for (ssize_t i = 0; i < n; i++) {                          // pass 1: feed fusion in timestamp order
+    // PASS 1: Feed the Kalman Engine as events arrive natively
+    for (ssize_t i = 0; i < n; i++) {                          
+        double ts_sec = events[i].timestamp / 1e9; // Convert nano to sec for engine
+        
         if (events[i].type == ASENSOR_TYPE_ACCELEROMETER) {
-            fusion_accel(events[i].acceleration.v, events[i].timestamp);
-            latest = events[i].timestamp;
-        } else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || events[i].type == 14) {
-            float m[3] = { events[i].uncalibrated_magnetic.x_uncalib - HARD_IRON_X,
-                           events[i].uncalibrated_magnetic.y_uncalib - HARD_IRON_Y,
-                           events[i].uncalibrated_magnetic.z_uncalib - HARD_IRON_Z };
-            fusion_mag(m, events[i].timestamp);
-            latest = events[i].timestamp;
+            vgyro.onAccel(ts_sec, events[i].acceleration.x, events[i].acceleration.y, events[i].acceleration.z);
+        } 
+        // Feed Uncalibrated Mag with your Custom Hard-Iron subtraction
+        else if (events[i].type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || events[i].type == 14) {
+            float mx = events[i].uncalibrated_magnetic.x_uncalib - HARD_IRON_X;
+            float my = events[i].uncalibrated_magnetic.y_uncalib - HARD_IRON_Y;
+            float mz = events[i].uncalibrated_magnetic.z_uncalib - HARD_IRON_Z;
+            vgyro.onMag(ts_sec, mx, my, mz);
         }
     }
-    if (latest > 0) fusion_finish(latest);
 
-    for (ssize_t i = 0; i < n; i++) {                          // pass 2: gyro events get the FRESH value[span_23](start_span)[span_23](end_span)
+    // PASS 2: Output flawless true hardware velocity to the Gyro
+    for (ssize_t i = 0; i < n; i++) {                          
         if (events[i].type == ASENSOR_TYPE_GYROSCOPE || events[i].type == 4 || events[i].type == 16) {
-            events[i].vector.x = final_gyro[0];
-            events[i].vector.y = final_gyro[1];
-            events[i].vector.z = final_gyro[2];
+            float rate[3];
+            vgyro.getRate(rate);
+            
+            // True 3D velocity mapping; Android Display framework rotates it automatically for CODM
+            events[i].vector.x = rate[0];
+            events[i].vector.y = rate[1];
+            events[i].vector.z = rate[2]; 
         }
     }
     return n;
