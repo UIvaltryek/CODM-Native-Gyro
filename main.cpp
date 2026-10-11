@@ -79,16 +79,16 @@ static inline real soft_gate(real dev, real tol) { real x = dev / tol; return x 
 struct Params {
     real sigma_tilt  = 0.03;     
     real sigma_head  = 0.03;     
-    real hand_acc    = 24.0;     // Instant trust for fast flick shots
+    real hand_acc    = 24.0;     
     real g_tol       = 2.0;      
     real mag_tol     = 0.15;     
     real dip_tol     = 0.13962634015954636; 
     real jump_reject = 0.5235987755982988; 
     real tilt_reject = 0.70;     
     real outage_tau  = 0.15;     
-    real deadzone    = 0.0;      // Zeroed for raw micro-aiming pass-through
-    real lock_hz     = 0.0;      // Zeroed to eliminate rubber-band spring effect
-    real max_gap     = 1.0;      // Forgiving 1.0s gap to prevent game stutter-restarts
+    real deadzone    = 0.0;      
+    real lock_hz     = 0.0;      
+    real max_gap     = 1.0;      
     real mag_wait    = 0.5;      
 };
 
@@ -271,12 +271,6 @@ typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
 static getEvents_t orig_getEvents = nullptr;
 static setEventRate_t orig_setEventRate = nullptr;
 
-typedef int (*log_print_t)(int, const char*, const char*, ...);
-static log_print_t log_print = nullptr;
-#define VLOG(...) do { if (log_print) log_print(4, "VGYRO", __VA_ARGS__); } while (0)
-static void log_init() { if (!log_print) log_print = (log_print_t)dlsym(RTLD_DEFAULT, "__android_log_print"); }
-
-static int c_game_acc = 0, c_game_mag = 0, c_game_gyro = 0, c_own_acc = 0, c_own_mag = 0;   
 static std::atomic<int> own_state{0};                                                       
 
 static inline void feed_accel(const ASensorEvent& e) {
@@ -329,21 +323,20 @@ static void* sensor_thread_main(void* arg) {
     if (FILE* f = fopen("/proc/self/cmdline", "r")) { size_t n = fread(pkg, 1, sizeof(pkg) - 1, f); pkg[n] = 0; fclose(f); }
     ASensorManager* mgr = (api.getInstanceForPackage && pkg[0]) ? api.getInstanceForPackage(pkg) : nullptr;
     if (!mgr && api.getInstance) mgr = api.getInstance();
-    if (!mgr) { VLOG("own subscription: no ASensorManager"); own_state.store(-1); return nullptr; }
+    if (!mgr) { own_state.store(-1); return nullptr; }
     ALooper* looper = api.looperPrepare(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS);
     ASensorEventQueue* q = looper ? api.createEventQueue(mgr, looper, VG_LOOPER_ID, nullptr, nullptr) : nullptr;
     const ASensor* acc = api.getDefaultSensor(mgr, ASENSOR_TYPE_ACCELEROMETER);
     int mag_type = 14;
     const ASensor* mag = api.getDefaultSensor(mgr, 14);                  
     if (!mag) { mag_type = 2; mag = api.getDefaultSensor(mgr, 2); }      
-    if (!q || !acc || !mag) { VLOG("own subscription: queue=%d accel=%d mag=%d", q != nullptr, acc != nullptr, mag != nullptr); own_state.store(-1); return nullptr; }
-    if (api.enableSensor(q, acc) < 0 || api.enableSensor(q, mag) < 0) { VLOG("own subscription: enableSensor failed"); own_state.store(-1); return nullptr; }
+    if (!q || !acc || !mag) { own_state.store(-1); return nullptr; }
+    if (api.enableSensor(q, acc) < 0 || api.enableSensor(q, mag) < 0) { own_state.store(-1); return nullptr; }
     
     // Max hardware pull: 200 Hz Accel / 200 Hz Mag (or as fast as the chip physically supports)
     api.setEventRate(q, acc, 5000);                                      
     api.setEventRate(q, mag, 5000);                                     
     own_state.store(1);
-    VLOG("own subscription running: accel + %s magnetometer", mag_type == 14 ? "uncalibrated" : "calibrated");
     
     ASensorEvent ev[64];
     for (;;) {
@@ -354,13 +347,12 @@ static void* sensor_thread_main(void* arg) {
         while ((n = api.getEvents(q, ev, 64)) > 0) {
             std::lock_guard<std::mutex> lock(vg_lock);
             for (ssize_t i = 0; i < n; i++) {
-                if (ev[i].type == ASENSOR_TYPE_ACCELEROMETER) { c_own_acc++; feed_accel(ev[i]); }
-                else if (mag_type == 14 && ev[i].type == 14)  { c_own_mag++; feed_mag_uncal(ev[i]); }
-                else if (mag_type == 2 && ev[i].type == 2)    { c_own_mag++; feed_mag_cal(ev[i]); }
+                if (ev[i].type == ASENSOR_TYPE_ACCELEROMETER) { feed_accel(ev[i]); }
+                else if (mag_type == 14 && ev[i].type == 14)  { feed_mag_uncal(ev[i]); }
+                else if (mag_type == 2 && ev[i].type == 2)    { feed_mag_cal(ev[i]); }
             }
         }
     }
-    VLOG("own subscription stopped");
     own_state.store(-1);
     return nullptr;
 }
@@ -368,48 +360,29 @@ static void* sensor_thread_main(void* arg) {
 static std::atomic_flag own_started = ATOMIC_FLAG_INIT;
 static void start_sensor_thread() {
     NdkApi* api = new NdkApi();
-    if (!ndk_loader(*api)) { VLOG("own subscription: could not resolve libandroid symbols"); own_state.store(-1); delete api; return; }
+    if (!ndk_loader(*api)) { own_state.store(-1); delete api; return; }
     pthread_t th;
     if (pthread_create(&th, nullptr, sensor_thread_main, api) == 0) pthread_detach(th);
-    else { VLOG("own subscription: pthread_create failed"); own_state.store(-1); delete api; }
-}
-
-static void maybe_log() {                          
-    if (!log_print) return;
-    static double next = 0; static int logs = 0;
-    timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    double now = ts.tv_sec + ts.tv_nsec * 1e-9;
-    if (now < next) return;
-    next = now + (logs++ < 30 ? 1.0 : 10.0);
-    int os = own_state.load();
-    VLOG("game queue: acc=%d mag=%d gyro=%d | own sub: %s acc=%d mag=%d | ready=%d heading=%d trust tilt=%.2f yaw=%.2f | |w|=%.3f rad/s",
-         c_game_acc, c_game_mag, c_game_gyro, os == 1 ? "on" : (os < 0 ? "FAILED" : "off"), c_own_acc, c_own_mag,
-         (int)vg.ready(), (int)vg.has_heading(), vg.tilt_trust(), vg.yaw_trust(), vg.rate_now());
-    c_game_acc = c_game_mag = c_game_gyro = c_own_acc = c_own_mag = 0;
+    else { own_state.store(-1); delete api; }
 }
 
 ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent* events, size_t count) {
     ssize_t n = orig_getEvents(queue, events, count);
-    if (!own_started.test_and_set()) { log_init(); VLOG("first getEvents call: starting own accel+mag subscription"); start_sensor_thread(); }
+    if (!own_started.test_and_set()) { start_sensor_thread(); }
     if (n <= 0) return n;
     const bool own = own_state.load() == 1;        
     std::lock_guard<std::mutex> lock(vg_lock);
     for (ssize_t i = 0; i < n; i++) {
         ASensorEvent& e = events[i];
         if (e.type == ASENSOR_TYPE_ACCELEROMETER) {
-            c_game_acc++; if (!own) feed_accel(e);
+            if (!own) feed_accel(e);
         } else if (e.type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || e.type == 14) {
-            c_game_mag++; if (!own) feed_mag_uncal(e);
+            if (!own) feed_mag_uncal(e);
         } else if (e.type == ASENSOR_TYPE_GYROSCOPE || e.type == 4) {
-            c_game_gyro++;
             gl::V3 w = vg.sample(e.timestamp);          
             e.gyro.x = w.x; e.gyro.y = w.y; e.gyro.z = w.z;
         } else if (e.type == ASENSOR_TYPE_GYROSCOPE_UNCALIBRATED || e.type == 16) {
-            c_game_gyro++;
             gl::V3 w = vg.sample(e.timestamp);          
-            
-            // Explicit memory map for Type 16 Uncalibrated Gyro.
-            // Biases must be zeroed to prevent the game engine from applying an internal phantom drift correction.
             e.uncalibrated_gyro.x_uncalib = w.x; 
             e.uncalibrated_gyro.y_uncalib = w.y; 
             e.uncalibrated_gyro.z_uncalib = w.z;
@@ -418,7 +391,6 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
             e.uncalibrated_gyro.z_bias = 0.0f;
         }
     }
-    maybe_log();
     return n;
 }
 
@@ -428,16 +400,12 @@ int hook_ASensorEventQueue_setEventRate(ASensorEventQueue* queue, ASensor const*
 }
 
 void install_hook() {
-    log_init();
     void* libandroid = dlopen("libandroid.so", RTLD_NOW);
     if (libandroid) {
         void* target_get = dlsym(libandroid, "ASensorEventQueue_getEvents");
         void* target_rate = dlsym(libandroid, "ASensorEventQueue_setEventRate");
         if (target_get) DobbyHook(target_get, (dobby_dummy_func_t)hook_ASensorEventQueue_getEvents, (dobby_dummy_func_t*)&orig_getEvents);
         if (target_rate) DobbyHook(target_rate, (dobby_dummy_func_t)hook_ASensorEventQueue_setEventRate, (dobby_dummy_func_t*)&orig_setEventRate);
-        VLOG("hooks installed: getEvents=%d setEventRate=%d", target_get != nullptr, target_rate != nullptr);
-    } else {
-        VLOG("dlopen(libandroid.so) failed - no hooks");
     }
 }
 
