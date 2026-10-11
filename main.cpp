@@ -13,49 +13,24 @@
 #include "zygisk.hpp"
 
 // =====================================================================================================
-// Virtual gyroscope (accelerometer + magnetometer) - quaternion rate observer, no Euler angles anywhere.
-//
-//  * No gimbal lock / singularity: attitude is a unit quaternion, rates come from rotation vectors.
-//    Holding the phone upright in landscape ("TV mode") is just another orientation - nothing special-cased.
-//  * Tilt (aiming up/down, rolling) is corrected ONLY by the accelerometer; turning left/right (rotation
-//    about gravity) ONLY by the magnetometer, so a magnetic disturbance can never tilt the picture.
-//  * The angular velocity is the integral state of a PI observer, and each gyro sample we hand to the game
-//    is exactly the rotation of that attitude over that sample's own interval -> whatever the game
-//    integrates stays locked to the attitude estimate (no random walk, no drift).
-//  * Sensor events are in the device's natural frame; the game does the landscape remap, as with a real gyro.
-//  * The game rarely subscribes to the magnetometer, so the module opens its OWN accel+mag queue on a private
-//    thread (started on the game's first getEvents call). If that fails it falls back to whatever accel/mag
-//    events the game's queue carries, and without any magnetometer it still tracks tilt.
-//
-// Debug:  adb logcat -s VGYRO     (one line per second for the first 30 s)
-// Tuning: gl::Params below (tilt_hz / yaw_hz = loop bandwidths; higher = less lag, more jitter).
+// Virtual gyroscope (accelerometer + magnetometer) - Kalman-style tracker.
+// Multithreaded Private Queue + Pure Quaternion Kinematics.
+// Optimized for Call of Duty: Mobile / BGMI.
 // =====================================================================================================
 
-// ===================== gyroless.inc =====================
-// Virtual gyroscope from accelerometer + magnetometer. No Android dependencies, no Euler angles.
-//
-//   * Attitude is a unit quaternion q (device -> earth; earth axes: x = magnetic north, y = west, z = up).
-//   * Accelerometer corrects TILT only, magnetometer corrects YAW (rotation about gravity) only.
-//   * The rate estimate is the integral state of a PI attitude observer (a "gyro-less Mahony"):
-//         e      = tilt_error + yaw_error                   (both are small-angle rotation vectors, device frame)
-//         w_hat += Ki * e * dt                              (angular velocity estimate = what a gyro would measure)
-//         q     <- q * exp( (w_hat + Kp * e) * dt / 2 )
-//   * Output for each gyro sample = rotation of q since the previous sample / dt, so whatever the game
-//     integrates stays locked to q (no random walk, no drift).
 namespace gl {
 
-struct V3 { float x, y, z; };
-static inline V3 operator+(V3 a, V3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
-static inline V3 operator-(V3 a, V3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
-static inline V3 operator*(V3 a, float s) { return {a.x * s, a.y * s, a.z * s}; }
-static inline float dot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-static inline V3 cross(V3 a, V3 b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
-static inline float len(V3 a) { return sqrtf(dot(a, a)); }
-static inline float ramp(float dev, float lo, float hi) {          // 1 below lo, 0 above hi
-    float t = (dev - lo) / (hi - lo); return t <= 0.f ? 1.f : (t >= 1.f ? 0.f : 1.f - t);
-}
+typedef double real;
+struct D3 { real x, y, z; };                                         
+struct V3 { float x, y, z; };                                       
+static inline D3 operator+(D3 a, D3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
+static inline D3 operator-(D3 a, D3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+static inline D3 operator*(D3 a, real s) { return {a.x * s, a.y * s, a.z * s}; }
+static inline real dot(D3 a, D3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static inline D3 cross(D3 a, D3 b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
+static inline real len(D3 a) { return sqrt(dot(a, a)); }
 
-struct Quat { float w, x, y, z; };
+struct Quat { real w, x, y, z; };
 static inline Quat qmul(Quat a, Quat b) {
     return {a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
             a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
@@ -64,48 +39,57 @@ static inline Quat qmul(Quat a, Quat b) {
 }
 static inline Quat qconj(Quat a) { return {a.w, -a.x, -a.y, -a.z}; }
 static inline Quat qnorm(Quat a) {
-    float n = sqrtf(a.w * a.w + a.x * a.x + a.y * a.y + a.z * a.z);
-    if (n < 1e-12f) return {1.f, 0.f, 0.f, 0.f};
-    float s = 1.f / n; return {a.w * s, a.x * s, a.y * s, a.z * s};
+    real n = sqrt(a.w * a.w + a.x * a.x + a.y * a.y + a.z * a.z);
+    if (n < 1e-300) return {1.0, 0.0, 0.0, 0.0};
+    real s = 1.0 / n; return {a.w * s, a.x * s, a.y * s, a.z * s};
 }
-static inline Quat qexp(V3 rv) {                                    // rotation vector -> quaternion
-    float th = len(rv);
-    if (th < 1e-7f) return qnorm({1.f, rv.x * 0.5f, rv.y * 0.5f, rv.z * 0.5f});
-    float s = sinf(th * 0.5f) / th; return {cosf(th * 0.5f), rv.x * s, rv.y * s, rv.z * s};
+static inline Quat qexp(D3 rv) {                                    
+    real th = len(rv);
+    if (th < 1e-9) return qnorm({1.0, rv.x * 0.5, rv.y * 0.5, rv.z * 0.5});
+    real s = sin(th * 0.5) / th; return {cos(th * 0.5), rv.x * s, rv.y * s, rv.z * s};
 }
-static inline V3 qlog(Quat q) {                                     // quaternion -> rotation vector (shortest arc)
-    if (q.w < 0.f) q = {-q.w, -q.x, -q.y, -q.z};
-    V3 v = {q.x, q.y, q.z}; float s = len(v);
-    if (s < 1e-7f) return v * 2.f;
-    return v * (2.f * atan2f(s, q.w) / s);
+static inline D3 qlog(Quat q) {                                     
+    if (q.w < 0.0) q = {-q.w, -q.x, -q.y, -q.z};
+    D3 v = {q.x, q.y, q.z}; real s = len(v);
+    if (s < 1e-12) return v * 2.0;
+    return v * (2.0 * atan2(s, q.w) / s);
 }
-// Rows of the device->earth rotation matrix = earth axes expressed in the device frame.
-static inline V3 north_in_dev(Quat q) { return {1.f - 2.f * (q.y * q.y + q.z * q.z), 2.f * (q.x * q.y - q.w * q.z), 2.f * (q.x * q.z + q.w * q.y)}; }
-static inline V3 up_in_dev(Quat q)    { return {2.f * (q.x * q.z - q.w * q.y), 2.f * (q.w * q.x + q.y * q.z), 1.f - 2.f * (q.x * q.x + q.y * q.y)}; }
 
-static Quat quat_from_rows(V3 r0, V3 r1, V3 r2) {                   // rotation matrix given by its rows
-    float R00 = r0.x, R01 = r0.y, R02 = r0.z, R10 = r1.x, R11 = r1.y, R12 = r1.z, R20 = r2.x, R21 = r2.y, R22 = r2.z;
-    float tr = R00 + R11 + R22; Quat q;
-    if (tr > 0.f)                      { float S = sqrtf(tr + 1.f) * 2.f;                 q = {0.25f * S, (R21 - R12) / S, (R02 - R20) / S, (R10 - R01) / S}; }
-    else if (R00 > R11 && R00 > R22)   { float S = sqrtf(1.f + R00 - R11 - R22) * 2.f;   q = {(R21 - R12) / S, 0.25f * S, (R01 + R10) / S, (R02 + R20) / S}; }
-    else if (R11 > R22)                { float S = sqrtf(1.f + R11 - R00 - R22) * 2.f;   q = {(R02 - R20) / S, (R01 + R10) / S, 0.25f * S, (R12 + R21) / S}; }
-    else                               { float S = sqrtf(1.f + R22 - R00 - R11) * 2.f;   q = {(R10 - R01) / S, (R02 + R20) / S, (R12 + R21) / S, 0.25f * S}; }
+static inline D3 row0(Quat q) { return {1 - 2 * (q.y * q.y + q.z * q.z), 2 * (q.x * q.y - q.w * q.z), 2 * (q.x * q.z + q.w * q.y)}; }
+static inline D3 row1(Quat q) { return {2 * (q.x * q.y + q.w * q.z), 1 - 2 * (q.x * q.x + q.z * q.z), 2 * (q.y * q.z - q.w * q.x)}; }
+static inline D3 up_in_dev(Quat q) { return {2 * (q.x * q.z - q.w * q.y), 2 * (q.y * q.z + q.w * q.x), 1 - 2 * (q.x * q.x + q.y * q.y)}; }
+
+static Quat quat_from_rows(D3 r0, D3 r1, D3 r2) {                   
+    real R00 = r0.x, R01 = r0.y, R02 = r0.z, R10 = r1.x, R11 = r1.y, R12 = r1.z, R20 = r2.x, R21 = r2.y, R22 = r2.z;
+    real tr = R00 + R11 + R22; Quat q;
+    if (tr > 0.0)                      { real S = sqrt(tr + 1.0) * 2.0;                 q = {0.25 * S, (R21 - R12) / S, (R02 - R20) / S, (R10 - R01) / S}; }
+    else if (R00 > R11 && R00 > R22)   { real S = sqrt(1.0 + R00 - R11 - R22) * 2.0;   q = {(R21 - R12) / S, 0.25 * S, (R01 + R10) / S, (R02 + R20) / S}; }
+    else if (R11 > R22)                { real S = sqrt(1.0 + R11 - R00 - R22) * 2.0;   q = {(R02 - R20) / S, (R01 + R10) / S, 0.25 * S, (R12 + R21) / S}; }
+    else                               { real S = sqrt(1.0 + R22 - R00 - R11) * 2.0;   q = {(R10 - R01) / S, (R02 + R20) / S, (R12 + R21) / S, 0.25 * S}; }
     return qnorm(q);
 }
 
+static inline D3 rotvec_between(D3 u, D3 v) {
+    D3 c = cross(u, v); real s = len(c);
+    if (s < 1e-12) return {0.0, 0.0, 0.0};
+    return c * (atan2(s, dot(u, v)) / s);
+}
+static inline real soft_gate(real dev, real tol) { real x = dev / tol; return x >= 1.0 ? 0.0 : 1.0 - x * x; }
+
 struct Params {
-    float tilt_hz  = 18.0f;    // bandwidth of the accelerometer loop (aiming up/down, rolling)
-    float yaw_hz   = 12.0f;    // bandwidth of the magnetometer loop (turning left/right) - noisiest sensor, keep it lower
-    float damping  = 0.9f;
-    float leak_s   = 2.0f;    // the rate state forgets with this time constant when nothing corrects it
-    float max_rate = 35.0f;   // rad/s clamp on the rate state
-    float max_gap  = 0.1f;    // s: longer silence (pause/resume) => restart cleanly
-    float stale    = 0.1f;    // s: a held measurement older than this is ignored
-    float mag_wait = 0.6f;    // s: no magnetometer by then => start tilt-only (turning is invisible without it); re-anchors when it shows up
-    // trust gates: full trust below *_lo, zero trust above *_hi (relative deviations)
-    float acc_lo = 0.02f, acc_hi = 0.12f;     // | |a| - 1g | / 1g
-    float mag_lo = 0.05f, mag_hi = 0.25f;     // | |m| - usual | / usual
-    float dip_lo = 0.04f, dip_hi = 0.15f;     // change of cos(angle between field and gravity)
+    real sigma_tilt  = 0.03;     
+    real sigma_head  = 0.03;     
+    real hand_acc    = 24.0;     // Instant trust for fast flick shots
+    real g_tol       = 2.0;      
+    real mag_tol     = 0.15;     
+    real dip_tol     = 0.13962634015954636; 
+    real jump_reject = 0.5235987755982988; 
+    real tilt_reject = 0.70;     
+    real outage_tau  = 0.15;     
+    real deadzone    = 0.0;      // Zeroed for raw micro-aiming pass-through
+    real lock_hz     = 0.0;      // Zeroed to eliminate rubber-band spring effect
+    real max_gap     = 1.0;      // Forgiving 1.0s gap to prevent game stutter-restarts
+    real mag_wait    = 0.5;      
 };
 
 class VirtualGyro {
@@ -113,172 +97,187 @@ public:
     explicit VirtualGyro(Params p = Params()) : P(p) { reset(); }
 
     void reset() {
-        q = {1.f, 0.f, 0.f, 0.f}; w = {0.f, 0.f, 0.f}; last_out = {0.f, 0.f, 0.f};
-        ua = {0.f, 0.f, 1.f}; um = {0.f, 1.f, 0.f};
-        have_a = have_m = inited = c0_ok = anchored = false; t_last = t_out = ta = tm = first_a = 0;
-        wa = wm = 0.f; g0 = 9.80665f; m0 = 0.f; c0 = 0.f; mcount = 0;
+        q = q_out = {1.0, 0.0, 0.0, 0.0}; w = last_out = a0 = m0 = {0.0, 0.0, 0.0};
+        inited = have_a = have_m = ref_valid = acc_seen = mag_seen = false;
+        t_last = t_out = t_acc = t_mag = ta0 = tm0 = ta_first = 0;
+        m_ref = dip_ref = 0.0; h_refx = 0.0; h_refy = 1.0; reject_t = reject_tilt_t = 0.0; wa = wm = 0.0;
     }
 
-    void onAccel(V3 a, int64_t t) {
-        advance(t);
-        float n = len(a); if (!(n > 1e-3f)) return;
-        if (!first_a) first_a = t;
-        float dt = ta ? (t - ta) * 1e-9f : 0.f; ta = t;
-        g0 += (n - g0) * fminf(1.f, dt / 10.f);                     // slow 1 g reference (tolerates sensor scale error)
-        wa = ramp(fabsf(n - g0) / g0, P.acc_lo, P.acc_hi);                // linear acceleration / shaking => trust less, ~0 in free fall
-        ua = a * (1.f / n); have_a = true;
-    }
+    void onAccel(V3 a, int64_t t) { on_accel({a.x, a.y, a.z}, t); }
+    void onMag(V3 m, int64_t t)   { on_mag({m.x, m.y, m.z}, t); }
+    V3 sample(int64_t t) { D3 r = sample_d(t); return {(float)r.x, (float)r.y, (float)r.z}; }
 
-    void onMag(V3 m, int64_t t) {
-        advance(t);
-        float n = len(m); if (!(n > 1e-3f)) return;
-        float dt = tm ? (t - tm) * 1e-9f : 0.f; tm = t;
-        float k = fmaxf(fminf(1.f, dt / 10.f), 1.f / (1.f + mcount)); if (mcount < 100000) mcount++;
-        if (m0 <= 0.f) m0 = n;
-        float wmag = ramp(fabsf(n - m0) / m0, P.mag_lo, P.mag_hi);         // field strength must look like the usual field
-        m0 += (n - m0) * k;
-        V3 u = m * (1.f / n);
-        float wdip = 1.f;
-        if (inited) {                                               // angle between field and gravity must stay put (dip)
-            float c = dot(u, up_in_dev(q));
-            if (!c0_ok) { c0 = c; c0_ok = true; }
-            wdip = ramp(fabsf(c - c0), P.dip_lo, P.dip_hi);
-            c0 += (c - c0) * k;
+    void on_accel(D3 a, int64_t t) {
+        real n = len(a); if (!(n > 1e-3)) return;                     
+        if (inited) advance(t);                                       
+        if (!inited) { a0 = a; ta0 = t; if (!have_a) { have_a = true; ta_first = t; } try_init(t); return; }
+        real T = interval(t, t_acc, acc_seen); t_acc = t; acc_seen = true;
+        D3 up = up_in_dev(q);
+        D3 e = rotvec_between(a * (1.0 / n), up);                     
+        if (len(e) > P.tilt_reject) {                                 
+            reject_tilt_t += T; wa = 0.0;
+            if (reject_tilt_t > 0.3) { restart(); a0 = a; ta0 = t; have_a = true; ta_first = t; return; }
+            decay(up, T, false); return;
         }
-        wm = wmag * wdip; um = u; have_m = true;
-        if (inited && !anchored && wm > 0.5f) anchor_yaw();
+        reject_tilt_t = 0.0;
+        wa = soft_gate(fabs(n - G), P.g_tol);                         
+        if (wa < 0.02) { decay(up, T, false); return; }               
+        correct(e, T, P.sigma_tilt / sqrt(wa));
     }
 
-    // Angular velocity (rad/s, device frame, right-hand rule) over (previous sample, t]. Call once per gyro event.
-    V3 sample(int64_t t) {
-        if (!inited) { advance(t); if (!inited) return {0.f, 0.f, 0.f}; }
-        if (t > t_last) { if ((t - t_last) * 1e-9f < 0.05f) advance(t); else t = t_last; }   // coast up to 50 ms; longer silence => output stops
-        if (!inited) return {0.f, 0.f, 0.f};
-        float dt = (t - t_out) * 1e-9f;
-        if (dt < 1e-6f) return {0.f, 0.f, 0.f};                          // nothing new: never repeat an old rate
-        Quat qt = q_at(t);                                               // the filter may be ahead of this gyro event or behind it
-        last_out = qlog(qmul(qconj(q_out), qt)) * (1.f / dt);
-        q_out = qt; t_out = t;
-        return last_out;
+    void on_mag(D3 m, int64_t t) {
+        real nm = len(m); if (!(nm > 1e-3)) return;
+        if (inited) advance(t);
+        if (!inited) { m0 = m; tm0 = t; have_m = true; try_init(t); return; }
+        real T = interval(t, t_mag, mag_seen); t_mag = t; mag_seen = true;
+        Quat q0 = q; D3 up = up_in_dev(q0);
+        real hx = dot(row0(q0), m), hy = dot(row1(q0), m);            
+        real hn = sqrt(hx * hx + hy * hy);
+        real dip = acos(fmax(-1.0, fmin(1.0, dot(m, up) / nm)));
+        if (!ref_valid) {                                             
+            if (hn >= 0.2 * nm) { h_refx = hx / hn; h_refy = hy / hn; m_ref = nm; dip_ref = dip; ref_valid = true; }
+            return;
+        }
+        real wgt = soft_gate(fabs(nm - m_ref) / m_ref, P.mag_tol) * soft_gate(fabs(dip - dip_ref), P.dip_tol);
+        if (hn < 0.2 * nm) wgt = 0.0;                                 
+        real psi = 0.0;
+        if (wgt >= 0.02) {
+            psi = atan2(hx * h_refy - hy * h_refx, hx * h_refx + hy * h_refy);
+            if (fabs(psi) > P.jump_reject) wgt = 0.0;                 
+        }
+        wm = wgt;
+        if (wgt < 0.02) {
+            reject_t += T;
+            if (reject_t > 0.5 && hn >= 0.2 * nm) {                   
+                h_refx = hx / hn; h_refy = hy / hn; m_ref = nm; dip_ref = dip; reject_t = 0.0;
+            }
+            decay(up, T, true);                                       
+            return;
+        }
+        reject_t = 0.0;
+        correct(up * psi, T, P.sigma_head / sqrt(wgt));               
+        if (wgt > 0.9) {                                              
+            real k = fmin(1.0, T / 20.0);
+            m_ref += k * (nm - m_ref); dip_ref += k * (dip - dip_ref);
+        }
     }
 
-    bool  ready()      const { return inited; }
-    bool  has_heading() const { return inited && anchored; }
-    float rate_now()   const { return len(last_out); }
-    float tilt_trust() const { return wa; }
-    float yaw_trust()  const { return wm; }
+    D3 sample_d(int64_t t) {
+        if (inited) advance(t);
+        if (!inited) return {0.0, 0.0, 0.0};
+        if (t <= t_out) return last_out;
+        real dt = (t - t_out) * 1e-9;
+        D3 wo = w; real n = len(w);
+        wo = (n <= P.deadzone) ? D3{0.0, 0.0, 0.0} : w * (1.0 - P.deadzone / n);
+        if (dt > P.max_gap) { q_out = q; t_out = t; last_out = wo; return wo; }
+        if (P.lock_hz > 0.0)                                          
+            wo = wo + qlog(qmul(qconj(q_out), q)) * (6.283185307179586 * P.lock_hz);
+        q_out = qnorm(qmul(q_out, qexp(wo * dt)));
+        t_out = t; last_out = wo;
+        return wo;
+    }
+
+    bool  ready()       const { return inited; }                  
+    bool  has_heading() const { return inited && ref_valid; }     
+    float rate_now()    const { return (float)len(last_out); }    
+    float tilt_trust() const { return (float)wa; }
+    float yaw_trust()  const { return (float)wm; }
     Quat  attitude()   const { return q; }
 
 private:
+    static constexpr real G = 9.80665;
     Params P;
-    Quat q, q_out; V3 w, last_out, ua, um;
-    struct Hist { int64_t t; Quat q; };
-    enum { HN = 256 };                                              // ~0.6 s of attitude history at 2.5 ms steps
-    Hist hist[HN]; int hcount = 0, hhead = 0;
-    void hist_reset(int64_t t) { hcount = 0; hhead = 0; hist_push(t, q); }
-    void hist_push(int64_t t, Quat qq) { hhead = (hhead + 1) % HN; hist[hhead] = {t, qq}; if (hcount < HN) hcount++; }
-    Quat q_at(int64_t t) const {                                    // attitude at time t (interpolated, shortest arc)
-        if (hcount == 0 || t >= hist[hhead].t) return q;
-        for (int n = 1; n < hcount; n++) {
-            int j = (hhead - n + HN) % HN;
-            if (hist[j].t <= t) {
-                const Hist& a = hist[j]; const Hist& b = hist[(j + 1) % HN];
-                if (b.t <= a.t) return a.q;
-                float f = (float)((double)(t - a.t) / (double)(b.t - a.t));
-                Quat qb = b.q; if (a.q.w * qb.w + a.q.x * qb.x + a.q.y * qb.y + a.q.z * qb.z < 0.f) qb = {-qb.w, -qb.x, -qb.y, -qb.z};
-                return qnorm({a.q.w + (qb.w - a.q.w) * f, a.q.x + (qb.x - a.q.x) * f, a.q.y + (qb.y - a.q.y) * f, a.q.z + (qb.z - a.q.z) * f});
-            }
-        }
-        return hist[(hhead - hcount + 1 + HN) % HN].q;              // older than the history: oldest we have
-    }
-    bool have_a, have_m, inited, c0_ok, anchored;
-    int64_t t_last, t_out, ta, tm, first_a;
-    float wa, wm, g0, m0, c0; int mcount;
+    Quat q, q_out; D3 w, last_out, a0, m0;
+    bool inited, have_a, have_m, ref_valid, acc_seen, mag_seen;
+    int64_t t_last, t_out, t_acc, t_mag, ta0, tm0, ta_first;
+    real m_ref, dip_ref, h_refx, h_refy, reject_t, reject_tilt_t, wa, wm;
 
-    void init_attitude(int64_t t, bool with_mag) {
-        V3 n;
-        if (with_mag) {
-            V3 h = um - ua * dot(um, ua); float hn = len(h);
-            if (hn < 0.05f) return;                                 // field parallel to gravity: heading undefined
-            n = h * (1.f / hn);
-        } else {                                                    // no magnetometer: any horizontal direction will do
-            V3 ref = fabsf(ua.z) < 0.9f ? V3{0.f, 0.f, 1.f} : V3{0.f, 1.f, 0.f};
-            V3 h = ref - ua * dot(ref, ua); n = h * (1.f / len(h));
-        }
-        q = quat_from_rows(n, cross(ua, n), ua);                    // rows: north, west, up
-        w = {0.f, 0.f, 0.f}; q_out = q; t_last = t_out = t; inited = true; last_out = {0.f, 0.f, 0.f};
-        anchored = with_mag; hist_reset(t);
-        if (with_mag) { c0 = dot(um, ua); c0_ok = true; } else c0_ok = false;
+    static real interval(int64_t t, int64_t prev, bool seen) {
+        if (!seen) return 0.01;
+        real T = (t - prev) * 1e-9; return fmin(0.1, fmax(1e-3, T));
     }
 
-    // Magnetometer arrived after a tilt-only start: adopt its heading silently (no rotation is reported to the game).
-    void anchor_yaw() {
-        V3 up = up_in_dev(q); V3 h = um - up * dot(um, up); float hn = len(h);
-        if (hn < 0.1f) return;
-        V3 n = h * (1.f / hn);
-        q = quat_from_rows(n, cross(up, n), up); q_out = q; t_out = t_last; hist_reset(t_last);
-        c0 = dot(um, up); c0_ok = true; anchored = true;
+    void correct(D3 e, real T, real sigma_meas) {
+        real lam = P.hand_acc * T * T / sigma_meas;                   
+        real r = (4.0 + lam - sqrt(8.0 * lam + lam * lam)) / 4.0;
+        real alpha = fmin(1.0 - r * r, 0.9);
+        real beta = fmin(fmax(2.0 * (2.0 - (1.0 - r * r)) - 4.0 * r, 0.0), 0.8);
+        q = qnorm(qmul(q, qexp(e * alpha)));
+        w = w + e * (beta / T);
+    }
+
+    void decay(D3 g, real T, bool along) {                            
+        real k = exp(-T / P.outage_tau);
+        D3 par = g * dot(w, g);
+        w = along ? (par * k + (w - par)) : (par + (w - par) * k);
     }
 
     void advance(int64_t t) {
-        if (!inited) {
-            if (have_a && have_m) init_attitude(t, true);
-            else if (have_a && first_a && (t - first_a) * 1e-9f > P.mag_wait) init_attitude(t, false);
-            return;
-        }
         if (t <= t_last) return;
-        float dt = (t - t_last) * 1e-9f;
-        if (dt > P.max_gap) { inited = false; have_a = have_m = c0_ok = anchored = false; mcount = 0; first_a = 0; return; }   // restart after a pause
-        int n = (int)ceilf(dt / 0.0025f); float h = dt / n;
-        int64_t t0 = t_last;
-        for (int i = 0; i < n; i++) {
-            int64_t ts = (i == n - 1) ? t : t0 + (int64_t)((i + 1) * h * 1e9f);
-            step(h, ts); hist_push(ts, q);
-        }
+        real dt = (t - t_last) * 1e-9;
+        if (dt > P.max_gap) { restart(); return; }
+        q = qnorm(qmul(q, qexp(w * dt)));
         t_last = t;
     }
 
-    void step(float h, int64_t t_now) {
-        V3 up = up_in_dev(q), north = north_in_dev(q);
-        float wa_e = (have_a && (t_now - ta) * 1e-9f < P.stale) ? wa : 0.f;
-        float wm_e = (have_m && (t_now - tm) * 1e-9f < P.stale) ? wm : 0.f;
-        V3 e_tilt = cross(ua, up) * wa_e;                           // lies in the plane perpendicular to gravity
-        V3 e_yaw = {0.f, 0.f, 0.f};
-        V3 hm = um - up * dot(um, up); float hn = len(hm);          // horizontal part of the measured field
-        if (hn > 0.1f && wm_e > 0.f) e_yaw = cross(hm * (1.f / hn), north) * wm_e;   // parallel to gravity
-        const float wt = 6.2831853f * P.tilt_hz, wy = 6.2831853f * P.yaw_hz;
-        const float kp_t = 2.f * P.damping * wt, ki_t = wt * wt, kp_y = 2.f * P.damping * wy, ki_y = wy * wy;
-        w = w + (e_tilt * ki_t + e_yaw * ki_y - w * (1.f / P.leak_s)) * h;
-        float wl = len(w); if (wl > P.max_rate) w = w * (P.max_rate / wl);
-        V3 w_eff = w + e_tilt * kp_t + e_yaw * kp_y;
-        q = qnorm(qmul(q, qexp(w_eff * h)));
+    void restart() {
+        inited = have_a = have_m = ref_valid = acc_seen = mag_seen = false;
+        w = {0.0, 0.0, 0.0}; reject_t = reject_tilt_t = 0.0;
+    }
+
+    void start(int64_t t) {
+        inited = true; w = last_out = {0.0, 0.0, 0.0}; q_out = q; t_last = t_out = t;
+        acc_seen = mag_seen = false; reject_t = reject_tilt_t = 0.0;
+    }
+
+    void try_init(int64_t t) {
+        if (have_a && have_m) {                                       
+            real an = len(a0), mn = len(m0);
+            D3 east = cross(m0, a0); real en = len(east);
+            if (en < 1e-3 * an * mn) return;                          
+            east = east * (1.0 / en);
+            D3 up = a0 * (1.0 / an), north = cross(up, east);
+            q = quat_from_rows(east, north, up);
+            m_ref = mn; dip_ref = acos(fmax(-1.0, fmin(1.0, dot(m0, a0) / (mn * an))));
+            h_refx = 0.0; h_refy = 1.0; ref_valid = true;             
+            start(ta0 > tm0 ? ta0 : tm0);
+        } else if (have_a && (t - ta_first) * 1e-9 > P.mag_wait) {    
+            real an = len(a0); D3 up = a0 * (1.0 / an);
+            D3 ex = {1.0, 0.0, 0.0};
+            D3 r0 = ex - up * dot(ex, up);
+            if (len(r0) < 0.3) { ex = {0.0, 1.0, 0.0}; r0 = ex - up * dot(ex, up); }
+            r0 = r0 * (1.0 / len(r0));
+            q = quat_from_rows(r0, cross(up, r0), up);
+            ref_valid = false; start(ta0);
+        }
     }
 };
 
 }  // namespace gl
 
-// ---- sensor access: the hook on the game's queue + our OWN accel/mag subscription ----
-// Most games never subscribe to the magnetometer, so we cannot rely on the game's queue to carry it.
-static const float HARD_IRON_X = 93.76f;      // your magnetometer offsets (uT), used for the uncalibrated mag type
+// =====================================================================================================
+// HOOKS & MULTITHREADING - Sensor polling + NDK overrides
+// =====================================================================================================
+
+static const float HARD_IRON_X = 93.76f;      
 static const float HARD_IRON_Y = -29.09f;
 static const float HARD_IRON_Z = 967.01f;
 
-static gl::VirtualGyro vg;                    // default tuning lives in gl::Params
-static std::mutex vg_lock;                    // game thread and our sensor thread both touch it
+static gl::VirtualGyro vg;                    
+static std::mutex vg_lock;                    
 
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
 typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
 static getEvents_t orig_getEvents = nullptr;
 static setEventRate_t orig_setEventRate = nullptr;
 
-// ---- logging, resolved at runtime (no extra link dependency):  adb logcat -s VGYRO ----
 typedef int (*log_print_t)(int, const char*, const char*, ...);
 static log_print_t log_print = nullptr;
 #define VLOG(...) do { if (log_print) log_print(4, "VGYRO", __VA_ARGS__); } while (0)
 static void log_init() { if (!log_print) log_print = (log_print_t)dlsym(RTLD_DEFAULT, "__android_log_print"); }
 
-static int c_game_acc = 0, c_game_mag = 0, c_game_gyro = 0, c_own_acc = 0, c_own_mag = 0;   // guarded by vg_lock
-static std::atomic<int> own_state{0};                                                       // 0 off, 1 running, -1 failed/stopped
+static int c_game_acc = 0, c_game_mag = 0, c_game_gyro = 0, c_own_acc = 0, c_own_mag = 0;   
+static std::atomic<int> own_state{0};                                                       
 
 static inline void feed_accel(const ASensorEvent& e) {
     vg.onAccel({e.acceleration.x, e.acceleration.y, e.acceleration.z}, e.timestamp);
@@ -292,7 +291,6 @@ static inline void feed_mag_cal(const ASensorEvent& e) {
     vg.onMag({e.magnetic.x, e.magnetic.y, e.magnetic.z}, e.timestamp);
 }
 
-// ---- our own sensor queue (accelerometer + magnetometer) on a private thread ----
 struct NdkApi {
     ASensorManager* (*getInstanceForPackage)(const char*) = nullptr;
     ASensorManager* (*getInstance)() = nullptr;
@@ -316,15 +314,14 @@ static bool load_ndk(NdkApi& a) {
     a.enableSensor          = (decltype(a.enableSensor))dlsym(lib, "ASensorEventQueue_enableSensor");
     a.pollOnce              = (decltype(a.pollOnce))dlsym(lib, "ALooper_pollOnce");
     if (!a.pollOnce) a.pollOnce = (decltype(a.pollOnce))dlsym(lib, "ALooper_pollAll");
-    // use the un-hooked originals for our own queue
     a.getEvents   = orig_getEvents ? orig_getEvents : (decltype(a.getEvents))dlsym(lib, "ASensorEventQueue_getEvents");
     a.setEventRate = orig_setEventRate ? orig_setEventRate : (decltype(a.setEventRate))dlsym(lib, "ASensorEventQueue_setEventRate");
     return (a.getInstanceForPackage || a.getInstance) && a.getDefaultSensor && a.looperPrepare && a.createEventQueue &&
            a.enableSensor && a.setEventRate && a.pollOnce && a.getEvents;
 }
-static bool (*ndk_loader)(NdkApi&) = load_ndk;       // replaceable in tests
+static bool (*ndk_loader)(NdkApi&) = load_ndk;       
 
-#define VG_LOOPER_ID 3                               // LOOPER_ID_USER
+#define VG_LOOPER_ID 3                               
 
 static void* sensor_thread_main(void* arg) {
     NdkApi api = *(NdkApi*)arg; delete (NdkApi*)arg;
@@ -337,14 +334,17 @@ static void* sensor_thread_main(void* arg) {
     ASensorEventQueue* q = looper ? api.createEventQueue(mgr, looper, VG_LOOPER_ID, nullptr, nullptr) : nullptr;
     const ASensor* acc = api.getDefaultSensor(mgr, ASENSOR_TYPE_ACCELEROMETER);
     int mag_type = 14;
-    const ASensor* mag = api.getDefaultSensor(mgr, 14);                  // uncalibrated (your offsets apply)
-    if (!mag) { mag_type = 2; mag = api.getDefaultSensor(mgr, 2); }      // else calibrated
+    const ASensor* mag = api.getDefaultSensor(mgr, 14);                  
+    if (!mag) { mag_type = 2; mag = api.getDefaultSensor(mgr, 2); }      
     if (!q || !acc || !mag) { VLOG("own subscription: queue=%d accel=%d mag=%d", q != nullptr, acc != nullptr, mag != nullptr); own_state.store(-1); return nullptr; }
     if (api.enableSensor(q, acc) < 0 || api.enableSensor(q, mag) < 0) { VLOG("own subscription: enableSensor failed"); own_state.store(-1); return nullptr; }
-    api.setEventRate(q, acc, 5000);                                      // 200 Hz (no special permission needed)
-    api.setEventRate(q, mag, 5000);                                     // 200 Hz
+    
+    // Max hardware pull: 200 Hz Accel / 200 Hz Mag (or as fast as the chip physically supports)
+    api.setEventRate(q, acc, 5000);                                      
+    api.setEventRate(q, mag, 5000);                                     
     own_state.store(1);
     VLOG("own subscription running: accel + %s magnetometer", mag_type == 14 ? "uncalibrated" : "calibrated");
+    
     ASensorEvent ev[64];
     for (;;) {
         int ident = api.pollOnce(500, nullptr, nullptr, nullptr);
@@ -374,8 +374,7 @@ static void start_sensor_thread() {
     else { VLOG("own subscription: pthread_create failed"); own_state.store(-1); delete api; }
 }
 
-// ---- once a second (first 30 s), then every 10 s: what is actually happening ----
-static void maybe_log() {                          // call with vg_lock held
+static void maybe_log() {                          
     if (!log_print) return;
     static double next = 0; static int logs = 0;
     timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -389,12 +388,11 @@ static void maybe_log() {                          // call with vg_lock held
     c_game_acc = c_game_mag = c_game_gyro = c_own_acc = c_own_mag = 0;
 }
 
-// ---- hook on the game's queue: rewrite its gyro events ----
 ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent* events, size_t count) {
     ssize_t n = orig_getEvents(queue, events, count);
     if (!own_started.test_and_set()) { log_init(); VLOG("first getEvents call: starting own accel+mag subscription"); start_sensor_thread(); }
     if (n <= 0) return n;
-    const bool own = own_state.load() == 1;        // if our own subscription is up, ignore accel/mag in the game's queue
+    const bool own = own_state.load() == 1;        
     std::lock_guard<std::mutex> lock(vg_lock);
     for (ssize_t i = 0; i < n; i++) {
         ASensorEvent& e = events[i];
@@ -402,19 +400,31 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
             c_game_acc++; if (!own) feed_accel(e);
         } else if (e.type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || e.type == 14) {
             c_game_mag++; if (!own) feed_mag_uncal(e);
-        } else if (e.type == ASENSOR_TYPE_GYROSCOPE || e.type == 4 || e.type == 16) {
+        } else if (e.type == ASENSOR_TYPE_GYROSCOPE || e.type == 4) {
             c_game_gyro++;
-            gl::V3 w = vg.sample(e.timestamp);          // rotation of the attitude since the previous gyro sample
-            e.vector.x = w.x; e.vector.y = w.y; e.vector.z = w.z;
+            gl::V3 w = vg.sample(e.timestamp);          
+            e.gyro.x = w.x; e.gyro.y = w.y; e.gyro.z = w.z;
+        } else if (e.type == ASENSOR_TYPE_GYROSCOPE_UNCALIBRATED || e.type == 16) {
+            c_game_gyro++;
+            gl::V3 w = vg.sample(e.timestamp);          
+            
+            // Explicit memory map for Type 16 Uncalibrated Gyro.
+            // Biases must be zeroed to prevent the game engine from applying an internal phantom drift correction.
+            e.uncalibrated_gyro.x_uncalib = w.x; 
+            e.uncalibrated_gyro.y_uncalib = w.y; 
+            e.uncalibrated_gyro.z_uncalib = w.z;
+            e.uncalibrated_gyro.x_bias = 0.0f;
+            e.uncalibrated_gyro.y_bias = 0.0f;
+            e.uncalibrated_gyro.z_bias = 0.0f;
         }
     }
     maybe_log();
     return n;
 }
 
-// ---- setEventRate hook (unchanged behaviour: ask for the fastest rate) ----
 int hook_ASensorEventQueue_setEventRate(ASensorEventQueue* queue, ASensor const* sensor, int32_t usec) {
-    return orig_setEventRate(queue, sensor, 0);      // Android 12+ may cap this without HIGH_SAMPLING_RATE_SENSORS
+    // Overrides all game delay requests and forces ASENSOR_DELAY_FASTEST (0)
+    return orig_setEventRate(queue, sensor, 0);      
 }
 
 void install_hook() {
@@ -423,7 +433,6 @@ void install_hook() {
     if (libandroid) {
         void* target_get = dlsym(libandroid, "ASensorEventQueue_getEvents");
         void* target_rate = dlsym(libandroid, "ASensorEventQueue_setEventRate");
-        // resolve before hooking so our own thread always has the un-hooked originals
         if (target_get) DobbyHook(target_get, (dobby_dummy_func_t)hook_ASensorEventQueue_getEvents, (dobby_dummy_func_t*)&orig_getEvents);
         if (target_rate) DobbyHook(target_rate, (dobby_dummy_func_t)hook_ASensorEventQueue_setEventRate, (dobby_dummy_func_t*)&orig_setEventRate);
         VLOG("hooks installed: getEvents=%d setEventRate=%d", target_get != nullptr, target_rate != nullptr);
@@ -438,11 +447,11 @@ public:
     void preAppSpecialize(zygisk::AppSpecializeArgs* args) override {
         const char* process = env->GetStringUTFChars(args->nice_name, nullptr);
         if (process) {
-            static const char* const targets[] = { "com.activision.callofduty.shooter",   // CODM (global)
-                                                   "com.garena.game.codm",                 // CODM (Garena)
-                                                   "com.tencent.tmgp.cod",                 // CODM (Tencent)
-                                                   "com.tencent.ig",                       // PUBG Mobile
-                                                   "com.pubg.imobile" };                   // BGMI
+            static const char* const targets[] = { "com.activision.callofduty.shooter",   
+                                                   "com.garena.game.codm",                 
+                                                   "com.tencent.tmgp.cod",                 
+                                                   "com.tencent.ig",                       
+                                                   "com.pubg.imobile" };                   
             for (const char* t : targets) if (strcmp(process, t) == 0) enable_hack = true;
             env->ReleaseStringUTFChars(args->nice_name, process);
         }
