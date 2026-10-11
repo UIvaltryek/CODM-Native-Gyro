@@ -200,8 +200,8 @@ private:
     void correct(D3 e, real T, real sigma_meas) {
         real lam = P.hand_acc * T * T / sigma_meas;                   
         real r = (4.0 + lam - sqrt(8.0 * lam + lam * lam)) / 4.0;
-        real alpha = fmin(1.0 - r * r, 0.9);
-        real beta = fmin(fmax(2.0 * (2.0 - (1.0 - r * r)) - 4.0 * r, 0.0), 0.8);
+        real alpha = fmin(1.0 - r * r, 0.98);
+        real beta = fmin(fmax(2.0 * (2.0 - (1.0 - r * r)) - 4.0 * r, 0.0), 0.98);
         q = qnorm(qmul(q, qexp(e * alpha)));
         w = w + e * (beta / T);
     }
