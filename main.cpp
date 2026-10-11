@@ -1,8 +1,13 @@
 #include <android/sensor.h>
+#include <android/looper.h>
 #include <dlfcn.h>
+#include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <math.h>
+#include <atomic>
 #include <mutex>
 #include "dobby.h"
 #include "zygisk.hpp"
@@ -15,13 +20,15 @@
 //  * Tilt (aiming up/down, rolling) is corrected ONLY by the accelerometer; turning left/right (rotation
 //    about gravity) ONLY by the magnetometer, so a magnetic disturbance can never tilt the picture.
 //  * The angular velocity is the integral state of a PI observer, and each gyro sample we hand to the game
-//    is exactly the rotation of that attitude since the previous sample -> whatever the game integrates stays
-//    locked to the attitude estimate (no random walk, no drift).
+//    is exactly the rotation of that attitude over that sample's own interval -> whatever the game
+//    integrates stays locked to the attitude estimate (no random walk, no drift).
 //  * Sensor events are in the device's natural frame; the game does the landscape remap, as with a real gyro.
+//  * The game rarely subscribes to the magnetometer, so the module opens its OWN accel+mag queue on a private
+//    thread (started on the game's first getEvents call). If that fails it falls back to whatever accel/mag
+//    events the game's queue carries, and without any magnetometer it still tracks tilt.
 //
-// Tuning (gl::Params below): tilt_hz / yaw_hz = loop bandwidths. Higher = less lag, more jitter.
-// Only rewrites gyro events the game already receives; needs accel + uncalibrated-mag events in the same
-// queue (or add your own subscription).
+// Debug:  adb logcat -s VGYRO     (one line per second for the first 30 s)
+// Tuning: gl::Params below (tilt_hz / yaw_hz = loop bandwidths; higher = less lag, more jitter).
 // =====================================================================================================
 
 // ===================== gyroless.inc =====================
@@ -94,6 +101,7 @@ struct Params {
     float max_rate = 35.0f;   // rad/s clamp on the rate state
     float max_gap  = 0.1f;    // s: longer silence (pause/resume) => restart cleanly
     float stale    = 0.1f;    // s: a held measurement older than this is ignored
+    float mag_wait = 0.6f;    // s: no magnetometer by then => start tilt-only (turning is invisible without it); re-anchors when it shows up
     // trust gates: full trust below *_lo, zero trust above *_hi (relative deviations)
     float acc_lo = 0.02f, acc_hi = 0.12f;     // | |a| - 1g | / 1g
     float mag_lo = 0.05f, mag_hi = 0.25f;     // | |m| - usual | / usual
@@ -107,13 +115,14 @@ public:
     void reset() {
         q = {1.f, 0.f, 0.f, 0.f}; w = {0.f, 0.f, 0.f}; last_out = {0.f, 0.f, 0.f};
         ua = {0.f, 0.f, 1.f}; um = {0.f, 1.f, 0.f};
-        have_a = have_m = inited = c0_ok = false; t_last = t_out = ta = tm = 0;
+        have_a = have_m = inited = c0_ok = anchored = false; t_last = t_out = ta = tm = first_a = 0;
         wa = wm = 0.f; g0 = 9.80665f; m0 = 0.f; c0 = 0.f; mcount = 0;
     }
 
     void onAccel(V3 a, int64_t t) {
         advance(t);
         float n = len(a); if (!(n > 1e-3f)) return;
+        if (!first_a) first_a = t;
         float dt = ta ? (t - ta) * 1e-9f : 0.f; ta = t;
         g0 += (n - g0) * fminf(1.f, dt / 10.f);                     // slow 1 g reference (tolerates sensor scale error)
         wa = ramp(fabsf(n - g0) / g0, P.acc_lo, P.acc_hi);                // linear acceleration / shaking => trust less, ~0 in free fall
@@ -137,19 +146,25 @@ public:
             c0 += (c - c0) * k;
         }
         wm = wmag * wdip; um = u; have_m = true;
+        if (inited && !anchored && wm > 0.5f) anchor_yaw();
     }
 
     // Angular velocity (rad/s, device frame, right-hand rule) over (previous sample, t]. Call once per gyro event.
     V3 sample(int64_t t) {
-        advance(t);
+        if (!inited) { advance(t); if (!inited) return {0.f, 0.f, 0.f}; }
+        if (t > t_last) { if ((t - t_last) * 1e-9f < 0.05f) advance(t); else t = t_last; }   // coast up to 50 ms; longer silence => output stops
         if (!inited) return {0.f, 0.f, 0.f};
-        float dt = (t_last - t_out) * 1e-9f;
-        if (dt < 1e-6f) return last_out;
-        last_out = qlog(qmul(qconj(q_out), q)) * (1.f / dt);
-        q_out = q; t_out = t_last;
+        float dt = (t - t_out) * 1e-9f;
+        if (dt < 1e-6f) return {0.f, 0.f, 0.f};                          // nothing new: never repeat an old rate
+        Quat qt = q_at(t);                                               // the filter may be ahead of this gyro event or behind it
+        last_out = qlog(qmul(qconj(q_out), qt)) * (1.f / dt);
+        q_out = qt; t_out = t;
         return last_out;
     }
 
+    bool  ready()      const { return inited; }
+    bool  has_heading() const { return inited && anchored; }
+    float rate_now()   const { return len(last_out); }
     float tilt_trust() const { return wa; }
     float yaw_trust()  const { return wm; }
     Quat  attitude()   const { return q; }
@@ -157,26 +172,69 @@ public:
 private:
     Params P;
     Quat q, q_out; V3 w, last_out, ua, um;
-    bool have_a, have_m, inited, c0_ok;
-    int64_t t_last, t_out, ta, tm;
+    struct Hist { int64_t t; Quat q; };
+    enum { HN = 256 };                                              // ~0.6 s of attitude history at 2.5 ms steps
+    Hist hist[HN]; int hcount = 0, hhead = 0;
+    void hist_reset(int64_t t) { hcount = 0; hhead = 0; hist_push(t, q); }
+    void hist_push(int64_t t, Quat qq) { hhead = (hhead + 1) % HN; hist[hhead] = {t, qq}; if (hcount < HN) hcount++; }
+    Quat q_at(int64_t t) const {                                    // attitude at time t (interpolated, shortest arc)
+        if (hcount == 0 || t >= hist[hhead].t) return q;
+        for (int n = 1; n < hcount; n++) {
+            int j = (hhead - n + HN) % HN;
+            if (hist[j].t <= t) {
+                const Hist& a = hist[j]; const Hist& b = hist[(j + 1) % HN];
+                if (b.t <= a.t) return a.q;
+                float f = (float)((double)(t - a.t) / (double)(b.t - a.t));
+                Quat qb = b.q; if (a.q.w * qb.w + a.q.x * qb.x + a.q.y * qb.y + a.q.z * qb.z < 0.f) qb = {-qb.w, -qb.x, -qb.y, -qb.z};
+                return qnorm({a.q.w + (qb.w - a.q.w) * f, a.q.x + (qb.x - a.q.x) * f, a.q.y + (qb.y - a.q.y) * f, a.q.z + (qb.z - a.q.z) * f});
+            }
+        }
+        return hist[(hhead - hcount + 1 + HN) % HN].q;              // older than the history: oldest we have
+    }
+    bool have_a, have_m, inited, c0_ok, anchored;
+    int64_t t_last, t_out, ta, tm, first_a;
     float wa, wm, g0, m0, c0; int mcount;
 
-    void init_attitude(int64_t t) {
-        V3 h = um - ua * dot(um, ua); float hn = len(h);
-        if (hn < 0.05f) return;                                     // field parallel to gravity: heading undefined
-        V3 n = h * (1.f / hn);
+    void init_attitude(int64_t t, bool with_mag) {
+        V3 n;
+        if (with_mag) {
+            V3 h = um - ua * dot(um, ua); float hn = len(h);
+            if (hn < 0.05f) return;                                 // field parallel to gravity: heading undefined
+            n = h * (1.f / hn);
+        } else {                                                    // no magnetometer: any horizontal direction will do
+            V3 ref = fabsf(ua.z) < 0.9f ? V3{0.f, 0.f, 1.f} : V3{0.f, 1.f, 0.f};
+            V3 h = ref - ua * dot(ref, ua); n = h * (1.f / len(h));
+        }
         q = quat_from_rows(n, cross(ua, n), ua);                    // rows: north, west, up
         w = {0.f, 0.f, 0.f}; q_out = q; t_last = t_out = t; inited = true; last_out = {0.f, 0.f, 0.f};
-        c0 = dot(um, ua); c0_ok = true;                             // field/gravity angle at start = the reference
+        anchored = with_mag; hist_reset(t);
+        if (with_mag) { c0 = dot(um, ua); c0_ok = true; } else c0_ok = false;
+    }
+
+    // Magnetometer arrived after a tilt-only start: adopt its heading silently (no rotation is reported to the game).
+    void anchor_yaw() {
+        V3 up = up_in_dev(q); V3 h = um - up * dot(um, up); float hn = len(h);
+        if (hn < 0.1f) return;
+        V3 n = h * (1.f / hn);
+        q = quat_from_rows(n, cross(up, n), up); q_out = q; t_out = t_last; hist_reset(t_last);
+        c0 = dot(um, up); c0_ok = true; anchored = true;
     }
 
     void advance(int64_t t) {
-        if (!inited) { if (have_a && have_m) init_attitude(t); return; }
+        if (!inited) {
+            if (have_a && have_m) init_attitude(t, true);
+            else if (have_a && first_a && (t - first_a) * 1e-9f > P.mag_wait) init_attitude(t, false);
+            return;
+        }
         if (t <= t_last) return;
         float dt = (t - t_last) * 1e-9f;
-        if (dt > P.max_gap) { inited = false; have_a = have_m = c0_ok = false; mcount = 0; return; }   // restart after a pause
+        if (dt > P.max_gap) { inited = false; have_a = have_m = c0_ok = anchored = false; mcount = 0; first_a = 0; return; }   // restart after a pause
         int n = (int)ceilf(dt / 0.0025f); float h = dt / n;
-        for (int i = 0; i < n; i++) step(h, t_last + (int64_t)((i + 1) * h * 1e9f));
+        int64_t t0 = t_last;
+        for (int i = 0; i < n; i++) {
+            int64_t ts = (i == n - 1) ? t : t0 + (int64_t)((i + 1) * h * 1e9f);
+            step(h, ts); hist_push(ts, q);
+        }
         t_last = t;
     }
 
@@ -199,51 +257,178 @@ private:
 
 }  // namespace gl
 
-// ---- hook: single pass, events in timestamp order ----
-static const float HARD_IRON_X = 93.76f;      // your magnetometer offsets (uT)
+// ---- sensor access: the hook on the game's queue + our OWN accel/mag subscription ----
+// Most games never subscribe to the magnetometer, so we cannot rely on the game's queue to carry it.
+static const float HARD_IRON_X = 93.76f;      // your magnetometer offsets (uT), used for the uncalibrated mag type
 static const float HARD_IRON_Y = -29.09f;
 static const float HARD_IRON_Z = 967.01f;
 
 static gl::VirtualGyro vg;                    // default tuning lives in gl::Params
-static std::mutex vg_lock;                    // the game may call getEvents from more than one thread
+static std::mutex vg_lock;                    // game thread and our sensor thread both touch it
 
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
+typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
 static getEvents_t orig_getEvents = nullptr;
+static setEventRate_t orig_setEventRate = nullptr;
 
+// ---- logging, resolved at runtime (no extra link dependency):  adb logcat -s VGYRO ----
+typedef int (*log_print_t)(int, const char*, const char*, ...);
+static log_print_t log_print = nullptr;
+#define VLOG(...) do { if (log_print) log_print(4, "VGYRO", __VA_ARGS__); } while (0)
+static void log_init() { if (!log_print) log_print = (log_print_t)dlsym(RTLD_DEFAULT, "__android_log_print"); }
+
+static int c_game_acc = 0, c_game_mag = 0, c_game_gyro = 0, c_own_acc = 0, c_own_mag = 0;   // guarded by vg_lock
+static std::atomic<int> own_state{0};                                                       // 0 off, 1 running, -1 failed/stopped
+
+static inline void feed_accel(const ASensorEvent& e) {
+    vg.onAccel({e.acceleration.x, e.acceleration.y, e.acceleration.z}, e.timestamp);
+}
+static inline void feed_mag_uncal(const ASensorEvent& e) {
+    vg.onMag({e.uncalibrated_magnetic.x_uncalib - HARD_IRON_X,
+              e.uncalibrated_magnetic.y_uncalib - HARD_IRON_Y,
+              e.uncalibrated_magnetic.z_uncalib - HARD_IRON_Z}, e.timestamp);
+}
+static inline void feed_mag_cal(const ASensorEvent& e) {
+    vg.onMag({e.magnetic.x, e.magnetic.y, e.magnetic.z}, e.timestamp);
+}
+
+// ---- our own sensor queue (accelerometer + magnetometer) on a private thread ----
+struct NdkApi {
+    ASensorManager* (*getInstanceForPackage)(const char*) = nullptr;
+    ASensorManager* (*getInstance)() = nullptr;
+    const ASensor* (*getDefaultSensor)(ASensorManager*, int) = nullptr;
+    ALooper* (*looperPrepare)(int) = nullptr;
+    ASensorEventQueue* (*createEventQueue)(ASensorManager*, ALooper*, int, ALooper_callbackFunc, void*) = nullptr;
+    int (*enableSensor)(ASensorEventQueue*, const ASensor*) = nullptr;
+    int (*setEventRate)(ASensorEventQueue*, const ASensor*, int32_t) = nullptr;
+    int (*pollOnce)(int, int*, int*, void**) = nullptr;
+    ssize_t (*getEvents)(ASensorEventQueue*, ASensorEvent*, size_t) = nullptr;
+};
+
+static bool load_ndk(NdkApi& a) {
+    void* lib = dlopen("libandroid.so", RTLD_NOW);
+    if (!lib) return false;
+    a.getInstanceForPackage = (decltype(a.getInstanceForPackage))dlsym(lib, "ASensorManager_getInstanceForPackage");
+    a.getInstance           = (decltype(a.getInstance))dlsym(lib, "ASensorManager_getInstance");
+    a.getDefaultSensor      = (decltype(a.getDefaultSensor))dlsym(lib, "ASensorManager_getDefaultSensor");
+    a.looperPrepare         = (decltype(a.looperPrepare))dlsym(lib, "ALooper_prepare");
+    a.createEventQueue      = (decltype(a.createEventQueue))dlsym(lib, "ASensorManager_createEventQueue");
+    a.enableSensor          = (decltype(a.enableSensor))dlsym(lib, "ASensorEventQueue_enableSensor");
+    a.pollOnce              = (decltype(a.pollOnce))dlsym(lib, "ALooper_pollOnce");
+    if (!a.pollOnce) a.pollOnce = (decltype(a.pollOnce))dlsym(lib, "ALooper_pollAll");
+    // use the un-hooked originals for our own queue
+    a.getEvents   = orig_getEvents ? orig_getEvents : (decltype(a.getEvents))dlsym(lib, "ASensorEventQueue_getEvents");
+    a.setEventRate = orig_setEventRate ? orig_setEventRate : (decltype(a.setEventRate))dlsym(lib, "ASensorEventQueue_setEventRate");
+    return (a.getInstanceForPackage || a.getInstance) && a.getDefaultSensor && a.looperPrepare && a.createEventQueue &&
+           a.enableSensor && a.setEventRate && a.pollOnce && a.getEvents;
+}
+static bool (*ndk_loader)(NdkApi&) = load_ndk;       // replaceable in tests
+
+#define VG_LOOPER_ID 3                               // LOOPER_ID_USER
+
+static void* sensor_thread_main(void* arg) {
+    NdkApi api = *(NdkApi*)arg; delete (NdkApi*)arg;
+    char pkg[256] = {0};
+    if (FILE* f = fopen("/proc/self/cmdline", "r")) { size_t n = fread(pkg, 1, sizeof(pkg) - 1, f); pkg[n] = 0; fclose(f); }
+    ASensorManager* mgr = (api.getInstanceForPackage && pkg[0]) ? api.getInstanceForPackage(pkg) : nullptr;
+    if (!mgr && api.getInstance) mgr = api.getInstance();
+    if (!mgr) { VLOG("own subscription: no ASensorManager"); own_state.store(-1); return nullptr; }
+    ALooper* looper = api.looperPrepare(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS);
+    ASensorEventQueue* q = looper ? api.createEventQueue(mgr, looper, VG_LOOPER_ID, nullptr, nullptr) : nullptr;
+    const ASensor* acc = api.getDefaultSensor(mgr, ASENSOR_TYPE_ACCELEROMETER);
+    int mag_type = 14;
+    const ASensor* mag = api.getDefaultSensor(mgr, 14);                  // uncalibrated (your offsets apply)
+    if (!mag) { mag_type = 2; mag = api.getDefaultSensor(mgr, 2); }      // else calibrated
+    if (!q || !acc || !mag) { VLOG("own subscription: queue=%d accel=%d mag=%d", q != nullptr, acc != nullptr, mag != nullptr); own_state.store(-1); return nullptr; }
+    if (api.enableSensor(q, acc) < 0 || api.enableSensor(q, mag) < 0) { VLOG("own subscription: enableSensor failed"); own_state.store(-1); return nullptr; }
+    api.setEventRate(q, acc, 5000);                                      // 200 Hz (no special permission needed)
+    api.setEventRate(q, mag, 10000);                                     // 100 Hz
+    own_state.store(1);
+    VLOG("own subscription running: accel + %s magnetometer", mag_type == 14 ? "uncalibrated" : "calibrated");
+    ASensorEvent ev[64];
+    for (;;) {
+        int ident = api.pollOnce(500, nullptr, nullptr, nullptr);
+        if (ident == ALOOPER_POLL_ERROR) break;
+        if (ident != VG_LOOPER_ID) continue;
+        ssize_t n;
+        while ((n = api.getEvents(q, ev, 64)) > 0) {
+            std::lock_guard<std::mutex> lock(vg_lock);
+            for (ssize_t i = 0; i < n; i++) {
+                if (ev[i].type == ASENSOR_TYPE_ACCELEROMETER) { c_own_acc++; feed_accel(ev[i]); }
+                else if (mag_type == 14 && ev[i].type == 14)  { c_own_mag++; feed_mag_uncal(ev[i]); }
+                else if (mag_type == 2 && ev[i].type == 2)    { c_own_mag++; feed_mag_cal(ev[i]); }
+            }
+        }
+    }
+    VLOG("own subscription stopped");
+    own_state.store(-1);
+    return nullptr;
+}
+
+static std::atomic_flag own_started = ATOMIC_FLAG_INIT;
+static void start_sensor_thread() {
+    NdkApi* api = new NdkApi();
+    if (!ndk_loader(*api)) { VLOG("own subscription: could not resolve libandroid symbols"); own_state.store(-1); delete api; return; }
+    pthread_t th;
+    if (pthread_create(&th, nullptr, sensor_thread_main, api) == 0) pthread_detach(th);
+    else { VLOG("own subscription: pthread_create failed"); own_state.store(-1); delete api; }
+}
+
+// ---- once a second (first 30 s), then every 10 s: what is actually happening ----
+static void maybe_log() {                          // call with vg_lock held
+    if (!log_print) return;
+    static double next = 0; static int logs = 0;
+    timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    double now = ts.tv_sec + ts.tv_nsec * 1e-9;
+    if (now < next) return;
+    next = now + (logs++ < 30 ? 1.0 : 10.0);
+    int os = own_state.load();
+    VLOG("game queue: acc=%d mag=%d gyro=%d | own sub: %s acc=%d mag=%d | ready=%d heading=%d trust tilt=%.2f yaw=%.2f | |w|=%.3f rad/s",
+         c_game_acc, c_game_mag, c_game_gyro, os == 1 ? "on" : (os < 0 ? "FAILED" : "off"), c_own_acc, c_own_mag,
+         (int)vg.ready(), (int)vg.has_heading(), vg.tilt_trust(), vg.yaw_trust(), vg.rate_now());
+    c_game_acc = c_game_mag = c_game_gyro = c_own_acc = c_own_mag = 0;
+}
+
+// ---- hook on the game's queue: rewrite its gyro events ----
 ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent* events, size_t count) {
     ssize_t n = orig_getEvents(queue, events, count);
+    if (!own_started.test_and_set()) { log_init(); VLOG("first getEvents call: starting own accel+mag subscription"); start_sensor_thread(); }
     if (n <= 0) return n;
+    const bool own = own_state.load() == 1;        // if our own subscription is up, ignore accel/mag in the game's queue
     std::lock_guard<std::mutex> lock(vg_lock);
     for (ssize_t i = 0; i < n; i++) {
         ASensorEvent& e = events[i];
         if (e.type == ASENSOR_TYPE_ACCELEROMETER) {
-            vg.onAccel({e.acceleration.x, e.acceleration.y, e.acceleration.z}, e.timestamp);
+            c_game_acc++; if (!own) feed_accel(e);
         } else if (e.type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || e.type == 14) {
-            vg.onMag({e.uncalibrated_magnetic.x_uncalib - HARD_IRON_X,
-                      e.uncalibrated_magnetic.y_uncalib - HARD_IRON_Y,
-                      e.uncalibrated_magnetic.z_uncalib - HARD_IRON_Z}, e.timestamp);
+            c_game_mag++; if (!own) feed_mag_uncal(e);
         } else if (e.type == ASENSOR_TYPE_GYROSCOPE || e.type == 4 || e.type == 16) {
+            c_game_gyro++;
             gl::V3 w = vg.sample(e.timestamp);          // rotation of the attitude since the previous gyro sample
             e.vector.x = w.x; e.vector.y = w.y; e.vector.z = w.z;
         }
     }
+    maybe_log();
     return n;
 }
 
-typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
-static setEventRate_t orig_setEventRate = nullptr;
-
+// ---- setEventRate hook (unchanged behaviour: ask for the fastest rate) ----
 int hook_ASensorEventQueue_setEventRate(ASensorEventQueue* queue, ASensor const* sensor, int32_t usec) {
-    return orig_setEventRate(queue, sensor, 0);      // ask for the fastest rate (Android 12+ may cap it without HIGH_SAMPLING_RATE_SENSORS)
+    return orig_setEventRate(queue, sensor, 0);      // Android 12+ may cap this without HIGH_SAMPLING_RATE_SENSORS
 }
 
 void install_hook() {
+    log_init();
     void* libandroid = dlopen("libandroid.so", RTLD_NOW);
     if (libandroid) {
         void* target_get = dlsym(libandroid, "ASensorEventQueue_getEvents");
-        if (target_get) DobbyHook(target_get, (dobby_dummy_func_t)hook_ASensorEventQueue_getEvents, (dobby_dummy_func_t*)&orig_getEvents);
         void* target_rate = dlsym(libandroid, "ASensorEventQueue_setEventRate");
+        // resolve before hooking so our own thread always has the un-hooked originals
+        if (target_get) DobbyHook(target_get, (dobby_dummy_func_t)hook_ASensorEventQueue_getEvents, (dobby_dummy_func_t*)&orig_getEvents);
         if (target_rate) DobbyHook(target_rate, (dobby_dummy_func_t)hook_ASensorEventQueue_setEventRate, (dobby_dummy_func_t*)&orig_setEventRate);
+        VLOG("hooks installed: getEvents=%d setEventRate=%d", target_get != nullptr, target_rate != nullptr);
+    } else {
+        VLOG("dlopen(libandroid.so) failed - no hooks");
     }
 }
 
@@ -253,7 +438,9 @@ public:
     void preAppSpecialize(zygisk::AppSpecializeArgs* args) override {
         const char* process = env->GetStringUTFChars(args->nice_name, nullptr);
         if (process) {
-            static const char* const targets[] = { "com.activision.callofduty.shooter",   // CODM
+            static const char* const targets[] = { "com.activision.callofduty.shooter",   // CODM (global)
+                                                   "com.garena.game.codm",                 // CODM (Garena)
+                                                   "com.tencent.tmgp.cod",                 // CODM (Tencent)
                                                    "com.tencent.ig",                       // PUBG Mobile
                                                    "com.pubg.imobile" };                   // BGMI
             for (const char* t : targets) if (strcmp(process, t) == 0) enable_hack = true;
