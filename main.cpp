@@ -79,11 +79,11 @@ static inline real soft_gate(real dev, real tol) { real x = dev / tol; return x 
 struct Params {
     real sigma_tilt  = 0.03;     
     real sigma_head  = 0.03;     
-    real hand_acc    = 24.0;     
-    real g_tol       = 2.0;      
+    real hand_acc    = 96.0;     
+    real g_tol       = 35.0;      
     real mag_tol     = 0.15;     
     real dip_tol     = 0.13962634015954636; 
-    real jump_reject = 0.5235987755982988; 
+    real jump_reject = 1.57079632679; 
     real tilt_reject = 0.70;     
     real outage_tau  = 0.15;     
     real deadzone    = 0.0;      
