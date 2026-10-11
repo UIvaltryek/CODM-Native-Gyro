@@ -94,8 +94,8 @@ static Quat quat_from_rows(V3 r0, V3 r1, V3 r2) {                   // rotation 
 }
 
 struct Params {
-    float tilt_hz  = 9.0f;    // bandwidth of the accelerometer loop (aiming up/down, rolling)
-    float yaw_hz   = 5.0f;    // bandwidth of the magnetometer loop (turning left/right) - noisiest sensor, keep it lower
+    float tilt_hz  = 18.0f;    // bandwidth of the accelerometer loop (aiming up/down, rolling)
+    float yaw_hz   = 12.0f;    // bandwidth of the magnetometer loop (turning left/right) - noisiest sensor, keep it lower
     float damping  = 0.9f;
     float leak_s   = 2.0f;    // the rate state forgets with this time constant when nothing corrects it
     float max_rate = 35.0f;   // rad/s clamp on the rate state
