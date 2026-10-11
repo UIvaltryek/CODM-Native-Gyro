@@ -342,7 +342,7 @@ static void* sensor_thread_main(void* arg) {
     if (!q || !acc || !mag) { VLOG("own subscription: queue=%d accel=%d mag=%d", q != nullptr, acc != nullptr, mag != nullptr); own_state.store(-1); return nullptr; }
     if (api.enableSensor(q, acc) < 0 || api.enableSensor(q, mag) < 0) { VLOG("own subscription: enableSensor failed"); own_state.store(-1); return nullptr; }
     api.setEventRate(q, acc, 5000);                                      // 200 Hz (no special permission needed)
-    api.setEventRate(q, mag, 10000);                                     // 100 Hz
+    api.setEventRate(q, mag, 5000);                                     // 200 Hz
     own_state.store(1);
     VLOG("own subscription running: accel + %s magnetometer", mag_type == 14 ? "uncalibrated" : "calibrated");
     ASensorEvent ev[64];
