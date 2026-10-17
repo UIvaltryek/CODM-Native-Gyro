@@ -2,6 +2,10 @@
 #include <android/looper.h>
 #include <dlfcn.h>
 #include <pthread.h>
+#include <sched.h>
+#include <sys/resource.h>
+#include <sys/prctl.h>
+#include <unistd.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -14,7 +18,7 @@
 
 // =====================================================================================================
 // Virtual gyroscope (accelerometer + magnetometer) - Kalman-style tracker.
-// Multithreaded Private Queue + Pure Quaternion Kinematics.
+// High-Priority Multithreaded Private Queue + Pure Quaternion Kinematics.
 // Optimized for Call of Duty: Mobile / BGMI.
 // =====================================================================================================
 
@@ -77,16 +81,20 @@ static inline D3 rotvec_between(D3 u, D3 v) {
 static inline real soft_gate(real dev, real tol) { real x = dev / tol; return x >= 1.0 ? 0.0 : 1.0 - x * x; }
 
 struct Params {
-    real sigma_tilt  = 0.01;     
-    real sigma_head  = 0.01;     
-    real hand_acc    = 150.0;     
+    // --- VIBRATION & EMI SHIELD ---
+    real sigma_tilt  = 0.08;     
+    real sigma_head  = 0.08;     
+    real hand_acc    = 45.0;     
+    
+    // --- FLICK IMMUNITY ---
     real g_tol       = 35.0;      
-    real mag_tol     = 1.00;     
-    real dip_tol     = 3.13962634015954636; 
+    real mag_tol     = 5.0;     
+    real dip_tol     = 3.14159; 
     real jump_reject = 3.14159; 
     real tilt_reject = 3.14159;     
+    
     real outage_tau  = 0.15;     
-    real deadzone    = 0.0;      
+    real deadzone    = 0.005;    // Acoustic micro-deadzone to swallow speaker/DAC buzz
     real lock_hz     = 0.0;      
     real max_gap     = 1.0;      
     real mag_wait    = 0.5;      
@@ -177,13 +185,6 @@ public:
         return wo;
     }
 
-    bool  ready()       const { return inited; }                  
-    bool  has_heading() const { return inited && ref_valid; }     
-    float rate_now()    const { return (float)len(last_out); }    
-    float tilt_trust() const { return (float)wa; }
-    float yaw_trust()  const { return (float)wm; }
-    Quat  attitude()   const { return q; }
-
 private:
     static constexpr real G = 9.80665;
     Params P;
@@ -200,8 +201,8 @@ private:
     void correct(D3 e, real T, real sigma_meas) {
         real lam = P.hand_acc * T * T / sigma_meas;                   
         real r = (4.0 + lam - sqrt(8.0 * lam + lam * lam)) / 4.0;
-        real alpha = fmin(1.0 - r * r, 0.95);
-        real beta = fmin(fmax(2.0 * (2.0 - (1.0 - r * r)) - 4.0 * r, 0.0), 0.85);
+        real alpha = fmin(1.0 - r * r, 0.9);
+        real beta = fmin(fmax(2.0 * (2.0 - (1.0 - r * r)) - 4.0 * r, 0.0), 0.8);
         q = qnorm(qmul(q, qexp(e * alpha)));
         w = w + e * (beta / T);
     }
@@ -256,7 +257,7 @@ private:
 }  // namespace gl
 
 // =====================================================================================================
-// HOOKS & MULTITHREADING - Sensor polling + NDK overrides
+// HOOKS, MULTITHREADING & PRIORITY ELEVATION
 // =====================================================================================================
 
 static const float HARD_IRON_X = 93.76f;      
@@ -317,7 +318,30 @@ static bool (*ndk_loader)(NdkApi&) = load_ndk;
 
 #define VG_LOOPER_ID 3                               
 
+static void boost_sensor_thread() {
+    // 1. Spoof thread name for OEM Game-Space / MediaTek HyperEngine low-latency whitelisting
+    pthread_setname_np(pthread_self(), "AudioTrack");
+
+    // 2. Set timer slack to 1ns so the kernel never batches/delays ALooper_pollOnce wakeups
+    prctl(PR_SET_TIMERSLACK, 1, 0, 0, 0);
+
+    // 3. Try Real-Time FIFO scheduling first; fallback to highest urgent nice priorities
+    struct sched_param sp = {};
+    sp.sched_priority = 2;
+    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
+        pid_t tid = gettid();
+        // -20 = Highest Priority, -16 = ANDROID_PRIORITY_AUDIO, -8 = ANDROID_PRIORITY_URGENT_DISPLAY
+        if (setpriority(PRIO_PROCESS, tid, -20) != 0) {
+            if (setpriority(PRIO_PROCESS, tid, -16) != 0) {
+                setpriority(PRIO_PROCESS, tid, -8);
+            }
+        }
+    }
+}
+
 static void* sensor_thread_main(void* arg) {
+    boost_sensor_thread();
+
     NdkApi api = *(NdkApi*)arg; delete (NdkApi*)arg;
     char pkg[256] = {0};
     if (FILE* f = fopen("/proc/self/cmdline", "r")) { size_t n = fread(pkg, 1, sizeof(pkg) - 1, f); pkg[n] = 0; fclose(f); }
@@ -333,7 +357,7 @@ static void* sensor_thread_main(void* arg) {
     if (!q || !acc || !mag) { own_state.store(-1); return nullptr; }
     if (api.enableSensor(q, acc) < 0 || api.enableSensor(q, mag) < 0) { own_state.store(-1); return nullptr; }
     
-    // Max hardware pull: 200 Hz Accel / 200 Hz Mag (or as fast as the chip physically supports)
+    // Max hardware pull: 200 Hz Accel / 200 Hz Mag
     api.setEventRate(q, acc, 5000);                                      
     api.setEventRate(q, mag, 5000);                                     
     own_state.store(1);
@@ -395,7 +419,6 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
 }
 
 int hook_ASensorEventQueue_setEventRate(ASensorEventQueue* queue, ASensor const* sensor, int32_t usec) {
-    // Overrides all game delay requests and forces ASENSOR_DELAY_FASTEST (0)
     return orig_setEventRate(queue, sensor, 0);      
 }
 
