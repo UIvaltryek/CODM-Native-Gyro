@@ -75,8 +75,8 @@ static inline D3 rotvec_between(D3 u, D3 v) {
 static inline real soft_gate(real dev, real tol) { real x = dev / tol; return x >= 1.0 ? 0.0 : 1.0 - x * x; }
 
 struct Params {
-    real sigma_tilt  = 0.035;     
-    real sigma_head  = 0.035;     
+    real sigma_tilt  = 0.04;     
+    real sigma_head  = 0.04;     
     real hand_acc    = 65.0;     
     real g_tol       = 35.0;      
     real mag_tol     = 5.0;     
@@ -190,7 +190,7 @@ private:
         real lam = P.hand_acc * T * T / sigma_meas;                   
         real r = (4.0 + lam - sqrt(8.0 * lam + lam * lam)) / 4.0;
         real alpha = fmin(1.0 - r * r, 0.9);
-        real beta = fmin(fmax(2.0 * (2.0 - (1.0 - r * r)) - 4.0 * r, 0.0), 0.825);
+        real beta = fmin(fmax(2.0 * (2.0 - (1.0 - r * r)) - 4.0 * r, 0.0), 0.8);
         q = qnorm(qmul(q, qexp(e * alpha)));
         w = w + e * (beta / T);
     }
