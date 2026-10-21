@@ -75,9 +75,9 @@ static inline D3 rotvec_between(D3 u, D3 v) {
 static inline real soft_gate(real dev, real tol) { real x = dev / tol; return x >= 1.0 ? 0.0 : 1.0 - x * x; }
 
 struct Params {
-    real sigma_tilt  = 0.04;     
-    real sigma_head  = 0.04;     
-    real hand_acc    = 65.0;     
+    real sigma_tilt  = 0.08;     
+    real sigma_head  = 0.08;     
+    real hand_acc    = 45.0;     
     real g_tol       = 35.0;      
     real mag_tol     = 5.0;     
     real dip_tol     = 3.14159; 
@@ -245,7 +245,7 @@ private:
 }  // namespace gl
 
 // =====================================================================================================
-// HOOKS, MULTITHREADING & PRIORITY ELEVATION
+// HOOKS, MULTITHREADING & ZERO-DELAY ENFORCEMENT
 // =====================================================================================================
 
 static const float HARD_IRON_X = 93.76f;      
@@ -257,8 +257,13 @@ static std::mutex vg_lock;
 
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
 typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
+typedef int (*registerSensor_t)(ASensorEventQueue*, ASensor const*, int32_t, int64_t);
+typedef int (*enableSensor_t)(ASensorEventQueue*, ASensor const*);
+
 static getEvents_t orig_getEvents = nullptr;
 static setEventRate_t orig_setEventRate = nullptr;
+static registerSensor_t orig_registerSensor = nullptr;
+static enableSensor_t orig_enableSensor = nullptr;
 
 static std::atomic<int> own_state{0};                                                       
 
@@ -282,6 +287,7 @@ struct NdkApi {
     ASensorEventQueue* (*createEventQueue)(ASensorManager*, ALooper*, int, ALooper_callbackFunc, void*) = nullptr;
     int (*enableSensor)(ASensorEventQueue*, const ASensor*) = nullptr;
     int (*setEventRate)(ASensorEventQueue*, const ASensor*, int32_t) = nullptr;
+    int (*registerSensor)(ASensorEventQueue*, const ASensor*, int32_t, int64_t) = nullptr;
     int (*pollOnce)(int, int*, int*, void**) = nullptr;
     ssize_t (*getEvents)(ASensorEventQueue*, ASensorEvent*, size_t) = nullptr;
 };
@@ -294,11 +300,14 @@ static bool load_ndk(NdkApi& a) {
     a.getDefaultSensor      = (decltype(a.getDefaultSensor))dlsym(lib, "ASensorManager_getDefaultSensor");
     a.looperPrepare         = (decltype(a.looperPrepare))dlsym(lib, "ALooper_prepare");
     a.createEventQueue      = (decltype(a.createEventQueue))dlsym(lib, "ASensorManager_createEventQueue");
-    a.enableSensor          = (decltype(a.enableSensor))dlsym(lib, "ASensorEventQueue_enableSensor");
     a.pollOnce              = (decltype(a.pollOnce))dlsym(lib, "ALooper_pollOnce");
     if (!a.pollOnce) a.pollOnce = (decltype(a.pollOnce))dlsym(lib, "ALooper_pollAll");
-    a.getEvents   = orig_getEvents ? orig_getEvents : (decltype(a.getEvents))dlsym(lib, "ASensorEventQueue_getEvents");
-    a.setEventRate = orig_setEventRate ? orig_setEventRate : (decltype(a.setEventRate))dlsym(lib, "ASensorEventQueue_setEventRate");
+    
+    a.enableSensor   = orig_enableSensor ? orig_enableSensor : (decltype(a.enableSensor))dlsym(lib, "ASensorEventQueue_enableSensor");
+    a.setEventRate   = orig_setEventRate ? orig_setEventRate : (decltype(a.setEventRate))dlsym(lib, "ASensorEventQueue_setEventRate");
+    a.registerSensor = orig_registerSensor ? orig_registerSensor : (decltype(a.registerSensor))dlsym(lib, "ASensorEventQueue_registerSensor");
+    a.getEvents      = orig_getEvents ? orig_getEvents : (decltype(a.getEvents))dlsym(lib, "ASensorEventQueue_getEvents");
+    
     return (a.getInstanceForPackage || a.getInstance) && a.getDefaultSensor && a.looperPrepare && a.createEventQueue &&
            a.enableSensor && a.setEventRate && a.pollOnce && a.getEvents;
 }
@@ -338,10 +347,17 @@ static void* sensor_thread_main(void* arg) {
     const ASensor* mag = api.getDefaultSensor(mgr, 14);                  
     if (!mag) { mag_type = 2; mag = api.getDefaultSensor(mgr, 2); }      
     if (!q || !acc || !mag) { own_state.store(-1); return nullptr; }
-    if (api.enableSensor(q, acc) < 0 || api.enableSensor(q, mag) < 0) { own_state.store(-1); return nullptr; }
-    
-    api.setEventRate(q, acc, 5000);                                      
-    api.setEventRate(q, mag, 5000);                                     
+
+    // Register with 0 delay and 0 batch latency
+    if (api.registerSensor) {
+        if (api.registerSensor(q, acc, 0, 0) < 0 || api.registerSensor(q, mag, 0, 0) < 0) {
+            own_state.store(-1); return nullptr;
+        }
+    } else {
+        if (api.enableSensor(q, acc) < 0 || api.enableSensor(q, mag) < 0) { own_state.store(-1); return nullptr; }
+    }
+    api.setEventRate(q, acc, 0);                                      
+    api.setEventRate(q, mag, 0);                                     
     own_state.store(1);
     
     ASensorEvent ev[64];
@@ -404,13 +420,31 @@ int hook_ASensorEventQueue_setEventRate(ASensorEventQueue* queue, ASensor const*
     return orig_setEventRate(queue, sensor, 0);      
 }
 
+int hook_ASensorEventQueue_registerSensor(ASensorEventQueue* queue, ASensor const* sensor, int32_t samplingPeriodUs, int64_t maxBatchReportLatencyUs) {
+    // Force 0 sampling period and 0 hardware FIFO batching latency on the stock virtual gyro carrier
+    return orig_registerSensor(queue, sensor, 0, 0);
+}
+
+int hook_ASensorEventQueue_enableSensor(ASensorEventQueue* queue, ASensor const* sensor) {
+    int res = orig_enableSensor(queue, sensor);
+    if (res >= 0 && orig_setEventRate) {
+        orig_setEventRate(queue, sensor, 0);
+    }
+    return res;
+}
+
 void install_hook() {
     void* libandroid = dlopen("libandroid.so", RTLD_NOW);
     if (libandroid) {
         void* target_get = dlsym(libandroid, "ASensorEventQueue_getEvents");
         void* target_rate = dlsym(libandroid, "ASensorEventQueue_setEventRate");
+        void* target_reg = dlsym(libandroid, "ASensorEventQueue_registerSensor");
+        void* target_en = dlsym(libandroid, "ASensorEventQueue_enableSensor");
+        
         if (target_get) DobbyHook(target_get, (dobby_dummy_func_t)hook_ASensorEventQueue_getEvents, (dobby_dummy_func_t*)&orig_getEvents);
         if (target_rate) DobbyHook(target_rate, (dobby_dummy_func_t)hook_ASensorEventQueue_setEventRate, (dobby_dummy_func_t*)&orig_setEventRate);
+        if (target_reg) DobbyHook(target_reg, (dobby_dummy_func_t)hook_ASensorEventQueue_registerSensor, (dobby_dummy_func_t*)&orig_registerSensor);
+        if (target_en) DobbyHook(target_en, (dobby_dummy_func_t)hook_ASensorEventQueue_enableSensor, (dobby_dummy_func_t*)&orig_enableSensor);
     }
 }
 
