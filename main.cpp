@@ -75,11 +75,11 @@ static inline D3 rotvec_between(D3 u, D3 v) {
 static inline real soft_gate(real dev, real tol) { real x = dev / tol; return x >= 1.0 ? 0.0 : 1.0 - x * x; }
 
 struct Params {
-    real sigma_tilt  = 0.08;     
-    real sigma_head  = 0.08;     
-    real hand_acc    = 45.0;     
-    real g_tol       = 35.0;      
-    real mag_tol     = 5.0;     
+    real sigma_tilt  = 0.01;     
+    real sigma_head  = 0.01;     
+    real hand_acc    = 135.0;     
+    real g_tol       = 70.0;      
+    real mag_tol     = 10.0;     
     real dip_tol     = 3.14159; 
     real jump_reject = 3.14159; 
     real tilt_reject = 3.14159;     
