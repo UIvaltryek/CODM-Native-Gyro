@@ -69,9 +69,9 @@ static inline real soft_gate(real dev, real tol) { real x = dev / tol; return x 
 struct Params {
     real sigma_tilt  = 0.04;
     real sigma_head  = 0.04;
-    real hand_acc    = 70.0;
+    real hand_acc    = 135.0;
     real g_tol       = 70.0;
-    real mag_tol     = 5.0;
+    real mag_tol     = 10.0;
     real dip_tol     = 3.14159;
     real jump_reject = 3.14159;
     real tilt_reject = 3.14159;
@@ -84,6 +84,8 @@ struct Params {
 class VirtualGyro {
 public:
     std::atomic<float> out_x{0.0f}, out_y{0.0f}, out_z{0.0f};
+    std::atomic<int64_t> latest_ts{0};
+    std::atomic<uint64_t> seq{0};
 
     explicit VirtualGyro(Params p = Params()) : P(p) { restart(); }
 
@@ -97,13 +99,13 @@ public:
         if (len(e) > P.tilt_reject) {
             reject_tilt_t += T;
             if (reject_tilt_t > 0.3) { restart(); a0 = a; ta0 = t; have_a = true; ta_first = t; return; }
-            decay(up, T, false); publish(); return;
+            decay(up, T, false); publish(t); return;
         }
         reject_tilt_t = 0.0;
         real wa = soft_gate(fabs(n - G), P.g_tol);
-        if (wa < 0.02) { decay(up, T, false); publish(); return; }
+        if (wa < 0.02) { decay(up, T, false); publish(t); return; }
         correct(e, T, P.sigma_tilt / sqrt(wa));
-        publish();
+        publish(t);
     }
 
     void on_mag(D3 m, int64_t t) {
@@ -131,7 +133,7 @@ public:
             if (reject_t > 0.5 && hn >= 0.2 * nm) {
                 h_refx = hx / hn; h_refy = hy / hn; m_ref = nm; dip_ref = dip; reject_t = 0.0;
             }
-            decay(up, T, true); publish();
+            decay(up, T, true); publish(t);
             return;
         }
         reject_t = 0.0;
@@ -140,7 +142,7 @@ public:
             real k = fmin(1.0, T * 0.05);
             m_ref += k * (nm - m_ref); dip_ref += k * (dip - dip_ref);
         }
-        publish();
+        publish(t);
     }
 
 private:
@@ -152,10 +154,14 @@ private:
     int64_t t_last = 0, t_acc = 0, t_mag = 0, ta0 = 0, tm0 = 0, ta_first = 0;
     real m_ref = 0.0, dip_ref = 0.0, h_refx = 0.0, h_refy = 1.0, reject_t = 0.0, reject_tilt_t = 0.0;
 
-    inline void publish() {
+    inline void publish(int64_t t) {
         out_x.store((float)w.x, std::memory_order_relaxed);
         out_y.store((float)w.y, std::memory_order_relaxed);
         out_z.store((float)w.z, std::memory_order_relaxed);
+        if (t > latest_ts.load(std::memory_order_relaxed)) {
+            latest_ts.store(t, std::memory_order_relaxed);
+        }
+        seq.fetch_add(1, std::memory_order_release);
     }
 
     static inline real interval(int64_t t, int64_t prev, bool seen) {
@@ -167,8 +173,8 @@ private:
     inline void correct(D3 e, real T, real sigma_meas) {
         real lam = P.hand_acc * T * T / sigma_meas;
         real r = (4.0 + lam - sqrt(8.0 * lam + lam * lam)) * 0.25;
-        real alpha = fmin(1.0 - r * r, 0.925);
-        real beta = fmin(fmax(2.0 * (1.0 + r * r) - 4.0 * r, 0.0), 0.825);
+        real alpha = fmin(1.0 - r * r, 0.9);
+        real beta = fmin(fmax(2.0 * (1.0 + r * r) - 4.0 * r, 0.0), 0.8);
         q = qnorm(qmul(q, qexp(e * alpha)));
         w = w + e * (beta / T);
     }
@@ -190,13 +196,15 @@ private:
     void restart() {
         inited = have_a = have_m = ref_valid = acc_seen = mag_seen = false;
         w = {0.0, 0.0, 0.0}; reject_t = reject_tilt_t = 0.0;
-        publish();
+        out_x.store(0.0f, std::memory_order_relaxed);
+        out_y.store(0.0f, std::memory_order_relaxed);
+        out_z.store(0.0f, std::memory_order_relaxed);
     }
 
     void start(int64_t t) {
         inited = true; w = {0.0, 0.0, 0.0}; t_last = t;
         acc_seen = mag_seen = false; reject_t = reject_tilt_t = 0.0;
-        publish();
+        publish(t);
     }
 
     void try_init(int64_t t) {
@@ -225,7 +233,7 @@ private:
 }  // namespace gl
 
 // =====================================================================================================
-// HOOKS, LOCK-FREE READOUT & ZERO-DELAY ENFORCEMENT
+// SYNTHETIC 0-DELAY PACKET GENERATOR & HARDWARE ACCEL CLOCK HIJACKING
 // =====================================================================================================
 
 static constexpr float HARD_IRON_X = 93.76f;
@@ -239,14 +247,28 @@ typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
 typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
 typedef int (*registerSensor_t)(ASensorEventQueue*, ASensor const*, int32_t, int64_t);
 typedef int (*enableSensor_t)(ASensorEventQueue*, ASensor const*);
+typedef int (*getSensorType_t)(ASensor const*);
 
 static getEvents_t orig_getEvents = nullptr;
 static setEventRate_t orig_setEventRate = nullptr;
 static registerSensor_t orig_registerSensor = nullptr;
 static enableSensor_t orig_enableSensor = nullptr;
+static getSensorType_t fn_getSensorType = nullptr;
+
+static const ASensor* g_hw_accel = nullptr;
+static std::atomic<ASensorEventQueue*> g_gyro_queue{nullptr};
+static std::atomic<bool> g_game_wants_accel_on_gyro_q{false};
+static std::atomic<bool> g_hijacked_accel_clock{false};
+static std::atomic<int32_t> g_gyro_handle{-1};
+static std::atomic<int32_t> g_gyro_type{ASENSOR_TYPE_GYROSCOPE};
 
 static std::atomic<int> own_state{0};
 static std::atomic_flag own_started = ATOMIC_FLAG_INIT;
+
+// State for synthetic packet injection & monotonic timestamping
+static int64_t g_last_gyro_ts = 0;
+static uint64_t g_last_emitted_seq = 0;
+static bool g_pending_synth = false;
 
 static inline void feed_accel(const ASensorEvent& e) {
     vg.on_accel({e.acceleration.x, e.acceleration.y, e.acceleration.z}, e.timestamp);
@@ -258,6 +280,33 @@ static inline void feed_mag_uncal(const ASensorEvent& e) {
 }
 static inline void feed_mag_cal(const ASensorEvent& e) {
     vg.on_mag({e.magnetic.x, e.magnetic.y, e.magnetic.z}, e.timestamp);
+}
+
+static inline void write_synthetic_gyro(ASensorEvent& dst, int32_t handle, int32_t type, float wx, float wy, float wz, int64_t base_ts) {
+    memset(&dst, 0, sizeof(ASensorEvent));
+    dst.version = sizeof(ASensorEvent);
+    dst.sensor = handle;
+    dst.type = type;
+    dst.gyro.status = ASENSOR_STATUS_ACCURACY_HIGH;
+
+    int64_t latest = vg.latest_ts.load(std::memory_order_relaxed);
+    int64_t ts = (latest > base_ts) ? latest : base_ts;
+    if (ts <= g_last_gyro_ts) ts = g_last_gyro_ts + 100000; // Strictly monotonic (+0.1ms min step)
+    g_last_gyro_ts = ts;
+    dst.timestamp = ts;
+
+    if (type == ASENSOR_TYPE_GYROSCOPE_UNCALIBRATED || type == 16) {
+        dst.uncalibrated_gyro.x_uncalib = wx;
+        dst.uncalibrated_gyro.y_uncalib = wy;
+        dst.uncalibrated_gyro.z_uncalib = wz;
+        dst.uncalibrated_gyro.x_bias = 0.0f;
+        dst.uncalibrated_gyro.y_bias = 0.0f;
+        dst.uncalibrated_gyro.z_bias = 0.0f;
+    } else {
+        dst.gyro.x = wx;
+        dst.gyro.y = wy;
+        dst.gyro.z = wz;
+    }
 }
 
 #define VG_LOOPER_ID 3
@@ -304,6 +353,7 @@ static void* sensor_thread_main(void*) {
     ALooper* looper = looperPrepare(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS);
     ASensorEventQueue* q = looper ? createEventQueue(mgr, looper, VG_LOOPER_ID, nullptr, nullptr) : nullptr;
     const ASensor* acc = getDefaultSensor(mgr, ASENSOR_TYPE_ACCELEROMETER);
+    g_hw_accel = acc; // Save hardware accelerometer pointer for waking the game's gyro queue
     int mag_type = 14;
     const ASensor* mag = getDefaultSensor(mgr, 14);
     if (!mag) { mag_type = 2; mag = getDefaultSensor(mgr, 2); }
@@ -339,31 +389,83 @@ static void* sensor_thread_main(void*) {
 }
 
 ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent* events, size_t count) {
-    ssize_t n = orig_getEvents(queue, events, count);
     if (__builtin_expect(!own_started.test_and_set(std::memory_order_relaxed), 0)) {
         pthread_t th;
         if (pthread_create(&th, nullptr, sensor_thread_main, nullptr) == 0) pthread_detach(th);
         else own_state.store(-1, std::memory_order_relaxed);
     }
+
+    // 1-Shot synthetic packet delivery when the previous call had count == 1 and couldn't append
+    if (__builtin_expect(g_pending_synth && queue == g_gyro_queue.load(std::memory_order_relaxed) && count >= 1, 0)) {
+        g_pending_synth = false;
+        int32_t handle = g_gyro_handle.load(std::memory_order_relaxed);
+        if (handle != -1) {
+            const float wx = vg.out_x.load(std::memory_order_relaxed);
+            const float wy = vg.out_y.load(std::memory_order_relaxed);
+            const float wz = vg.out_z.load(std::memory_order_relaxed);
+            write_synthetic_gyro(events[0], handle, g_gyro_type.load(std::memory_order_relaxed), wx, wy, wz, vg.latest_ts.load(std::memory_order_relaxed));
+            return 1;
+        }
+    }
+
+    ssize_t n = orig_getEvents(queue, events, count);
     if (n <= 0) return n;
 
     const int state = own_state.load(std::memory_order_acquire);
     if (__builtin_expect(state == 1, 1)) {
-        // Lock-free fast path: read latest angular rate directly without blocking on mutex
         const float wx = vg.out_x.load(std::memory_order_relaxed);
         const float wy = vg.out_y.load(std::memory_order_relaxed);
         const float wz = vg.out_z.load(std::memory_order_relaxed);
+        const bool is_gyro_q = (queue == g_gyro_queue.load(std::memory_order_relaxed));
+        const bool game_wants_acc = g_game_wants_accel_on_gyro_q.load(std::memory_order_relaxed);
+
+        bool emitted_gyro_in_batch = false;
+        int64_t batch_ts = 0;
+
         for (ssize_t i = 0; i < n; i++) {
             ASensorEvent& e = events[i];
-            if (e.type == ASENSOR_TYPE_GYROSCOPE || e.type == 4) {
-                e.gyro.x = wx; e.gyro.y = wy; e.gyro.z = wz;
-            } else if (e.type == ASENSOR_TYPE_GYROSCOPE_UNCALIBRATED || e.type == 16) {
-                e.uncalibrated_gyro.x_uncalib = wx;
-                e.uncalibrated_gyro.y_uncalib = wy;
-                e.uncalibrated_gyro.z_uncalib = wz;
-                e.uncalibrated_gyro.x_bias = 0.0f;
-                e.uncalibrated_gyro.y_bias = 0.0f;
-                e.uncalibrated_gyro.z_bias = 0.0f;
+            if (e.timestamp > batch_ts) batch_ts = e.timestamp;
+
+            if (e.type == ASENSOR_TYPE_GYROSCOPE || e.type == 4 || e.type == ASENSOR_TYPE_GYROSCOPE_UNCALIBRATED || e.type == 16) {
+                // Capture handle & queue on first gyro packet, then hijack hardware Accel to clock this queue at 200Hz+
+                if (__builtin_expect(g_gyro_handle.load(std::memory_order_relaxed) == -1, 0)) {
+                    g_gyro_handle.store(e.sensor, std::memory_order_relaxed);
+                    g_gyro_type.store(e.type, std::memory_order_relaxed);
+                    g_gyro_queue.store(queue, std::memory_order_relaxed);
+                }
+                if (__builtin_expect(!g_hijacked_accel_clock.load(std::memory_order_relaxed) && g_hw_accel != nullptr, 0)) {
+                    g_hijacked_accel_clock.store(true, std::memory_order_relaxed);
+                    if (orig_registerSensor) orig_registerSensor(queue, g_hw_accel, 0, 0);
+                    else if (orig_enableSensor) orig_enableSensor(queue, g_hw_accel);
+                    if (orig_setEventRate) orig_setEventRate(queue, g_hw_accel, 0);
+                }
+
+                write_synthetic_gyro(e, e.sensor, e.type, wx, wy, wz, e.timestamp);
+                emitted_gyro_in_batch = true;
+                g_last_emitted_seq = vg.seq.load(std::memory_order_relaxed);
+            } else if (e.type == ASENSOR_TYPE_ACCELEROMETER && is_gyro_q && !game_wants_acc) {
+                // Dedicated gyro queue woken up by our hijacked 200Hz+ hardware Accel: transmute in-place into a 0-delay Gyro packet!
+                int32_t handle = g_gyro_handle.load(std::memory_order_relaxed);
+                if (handle != -1) {
+                    write_synthetic_gyro(e, handle, g_gyro_type.load(std::memory_order_relaxed), wx, wy, wz, e.timestamp);
+                    emitted_gyro_in_batch = true;
+                    g_last_emitted_seq = vg.seq.load(std::memory_order_relaxed);
+                }
+            }
+        }
+
+        // Shared queue path: if woken by Accel and no Gyro packet was in this batch, inject a synthetic Gyro packet
+        uint64_t cur_seq = vg.seq.load(std::memory_order_acquire);
+        if (is_gyro_q && !emitted_gyro_in_batch && cur_seq != g_last_emitted_seq) {
+            int32_t handle = g_gyro_handle.load(std::memory_order_relaxed);
+            if (handle != -1) {
+                g_last_emitted_seq = cur_seq;
+                if ((size_t)n < count) {
+                    write_synthetic_gyro(events[n], handle, g_gyro_type.load(std::memory_order_relaxed), wx, wy, wz, batch_ts);
+                    n++;
+                } else {
+                    g_pending_synth = true; // Will be emitted on the immediate next iteration of the game's while() loop
+                }
             }
         }
         return n;
@@ -377,31 +479,40 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
             feed_accel(e);
         } else if (e.type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || e.type == 14) {
             feed_mag_uncal(e);
-        } else if (e.type == ASENSOR_TYPE_GYROSCOPE || e.type == 4) {
-            e.gyro.x = vg.out_x.load(std::memory_order_relaxed);
-            e.gyro.y = vg.out_y.load(std::memory_order_relaxed);
-            e.gyro.z = vg.out_z.load(std::memory_order_relaxed);
-        } else if (e.type == ASENSOR_TYPE_GYROSCOPE_UNCALIBRATED || e.type == 16) {
-            e.uncalibrated_gyro.x_uncalib = vg.out_x.load(std::memory_order_relaxed);
-            e.uncalibrated_gyro.y_uncalib = vg.out_y.load(std::memory_order_relaxed);
-            e.uncalibrated_gyro.z_uncalib = vg.out_z.load(std::memory_order_relaxed);
-            e.uncalibrated_gyro.x_bias = 0.0f;
-            e.uncalibrated_gyro.y_bias = 0.0f;
-            e.uncalibrated_gyro.z_bias = 0.0f;
+        } else if (e.type == ASENSOR_TYPE_GYROSCOPE || e.type == 4 || e.type == ASENSOR_TYPE_GYROSCOPE_UNCALIBRATED || e.type == 16) {
+            const float wx = vg.out_x.load(std::memory_order_relaxed);
+            const float wy = vg.out_y.load(std::memory_order_relaxed);
+            const float wz = vg.out_z.load(std::memory_order_relaxed);
+            write_synthetic_gyro(e, e.sensor, e.type, wx, wy, wz, e.timestamp);
         }
     }
     return n;
 }
 
+static void track_queue_subscription(ASensorEventQueue* queue, ASensor const* sensor) {
+    if (!fn_getSensorType || !sensor) return;
+    int type = fn_getSensorType(sensor);
+    if (type == ASENSOR_TYPE_GYROSCOPE || type == 4 || type == ASENSOR_TYPE_GYROSCOPE_UNCALIBRATED || type == 16) {
+        g_gyro_queue.store(queue, std::memory_order_relaxed);
+    } else if (type == ASENSOR_TYPE_ACCELEROMETER) {
+        if (queue == g_gyro_queue.load(std::memory_order_relaxed)) {
+            g_game_wants_accel_on_gyro_q.store(true, std::memory_order_relaxed);
+        }
+    }
+}
+
 int hook_ASensorEventQueue_setEventRate(ASensorEventQueue* queue, ASensor const* sensor, int32_t) {
+    track_queue_subscription(queue, sensor);
     return orig_setEventRate(queue, sensor, 0);
 }
 
 int hook_ASensorEventQueue_registerSensor(ASensorEventQueue* queue, ASensor const* sensor, int32_t, int64_t) {
+    track_queue_subscription(queue, sensor);
     return orig_registerSensor(queue, sensor, 0, 0);
 }
 
 int hook_ASensorEventQueue_enableSensor(ASensorEventQueue* queue, ASensor const* sensor) {
+    track_queue_subscription(queue, sensor);
     int res = orig_enableSensor(queue, sensor);
     if (res >= 0 && orig_setEventRate) orig_setEventRate(queue, sensor, 0);
     return res;
@@ -410,6 +521,7 @@ int hook_ASensorEventQueue_enableSensor(ASensorEventQueue* queue, ASensor const*
 void install_hook() {
     void* libandroid = dlopen("libandroid.so", RTLD_NOW);
     if (!libandroid) return;
+    fn_getSensorType  = (getSensorType_t)dlsym(libandroid, "ASensor_getType");
     void* target_get  = dlsym(libandroid, "ASensorEventQueue_getEvents");
     void* target_rate = dlsym(libandroid, "ASensorEventQueue_setEventRate");
     void* target_reg  = dlsym(libandroid, "ASensorEventQueue_registerSensor");
