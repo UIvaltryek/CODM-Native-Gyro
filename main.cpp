@@ -71,7 +71,7 @@ struct Params {
     real sigma_head  = 0.04;
     real hand_acc    = 70.0;
     real g_tol       = 70.0;
-    real mag_tol     = 2.5;
+    real mag_tol     = 5.0;
     real dip_tol     = 3.14159;
     real jump_reject = 3.14159;
     real tilt_reject = 3.14159;
