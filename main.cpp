@@ -26,6 +26,7 @@ static inline D3 operator*(D3 a, real s) { return {a.x * s, a.y * s, a.z * s}; }
 static inline real dot(D3 a, D3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 static inline D3 cross(D3 a, D3 b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
 static inline real len(D3 a) { return sqrt(dot(a, a)); }
+static inline real clamp01(real v) { return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v); }
 
 struct Quat { real w, x, y, z; };
 static inline Quat qmul(Quat a, Quat b) {
@@ -67,9 +68,9 @@ static inline D3 rotvec_between(D3 u, D3 v) {
 static inline real soft_gate(real dev, real tol) { real x = dev / tol; return x >= 1.0 ? 0.0 : 1.0 - x * x; }
 
 struct Params {
-    real sigma_tilt  = 0.05;
-    real sigma_head  = 0.065;
-    real hand_acc    = 70.0;
+    real sigma_tilt  = 0.04;
+    real sigma_head  = 0.04;
+    real hand_acc    = 135.0;
     real g_tol       = 70.0;
     real mag_tol     = 10.0;
     real dip_tol     = 3.14159;
@@ -147,17 +148,42 @@ public:
 
 private:
     static constexpr real G = 9.80665;
+    static constexpr real kDeg = 57.29577951308232;
+    static constexpr real kTwoPi = 6.283185307179586;
+
     Params P;
     Quat q{1.0, 0.0, 0.0, 0.0};
-    D3 w{0.0, 0.0, 0.0}, a0{0.0, 0.0, 0.0}, m0{0.0, 0.0, 0.0};
+    D3 w{0.0, 0.0, 0.0}, lag{0.0, 0.0, 0.0}, a0{0.0, 0.0, 0.0}, m0{0.0, 0.0, 0.0};
     bool inited = false, have_a = false, have_m = false, ref_valid = false, acc_seen = false, mag_seen = false;
-    int64_t t_last = 0, t_acc = 0, t_mag = 0, ta0 = 0, tm0 = 0, ta_first = 0;
+    int64_t t_last = 0, t_pub = 0, t_acc = 0, t_mag = 0, ta0 = 0, tm0 = 0, ta_first = 0;
     real m_ref = 0.0, dip_ref = 0.0, h_refx = 0.0, h_refy = 1.0, reject_t = 0.0, reject_tilt_t = 0.0;
 
+    // Stage 2: Angle-conserving 1-Euro smoother (1:1 total angle, ~10ms stationary smoothing, <1ms flick delay)
     inline void publish(int64_t t) {
-        out_x.store((float)w.x, std::memory_order_relaxed);
-        out_y.store((float)w.y, std::memory_order_relaxed);
-        out_z.store((float)w.z, std::memory_order_relaxed);
+        int64_t prev_t = t_pub;
+        if (t > prev_t) {
+            real dt = (t - prev_t) * 1e-9;
+            t_pub = t;
+            if (dt > 1e-4 && dt < 0.1) {
+                real spd_dps = len(w) * kDeg;
+                // 15 Hz at rest (kills 200Hz speaker/DAC buzz); scales by +2.5 Hz per deg/s for instant flicks
+                real fc = 15.0 + 2.5 * spd_dps;
+                real alpha = 1.0 - exp(-kTwoPi * fc * dt);
+                lag = lag + w * dt;
+                D3 dTheta = lag * alpha;
+                lag = lag - dTheta;
+                D3 w_out = dTheta * (1.0 / dt);
+
+                out_x.store((float)w_out.x, std::memory_order_relaxed);
+                out_y.store((float)w_out.y, std::memory_order_relaxed);
+                out_z.store((float)w_out.z, std::memory_order_relaxed);
+            } else {
+                lag = {0.0, 0.0, 0.0};
+                out_x.store((float)w.x, std::memory_order_relaxed);
+                out_y.store((float)w.y, std::memory_order_relaxed);
+                out_z.store((float)w.z, std::memory_order_relaxed);
+            }
+        }
         if (t > latest_ts.load(std::memory_order_relaxed)) {
             latest_ts.store(t, std::memory_order_relaxed);
         }
@@ -170,11 +196,22 @@ private:
         return T < 1e-3 ? 1e-3 : (T > 0.1 ? 0.1 : T);
     }
 
+    // Stage 1: Innovation-Adaptive Kalman update
     inline void correct(D3 e, real T, real sigma_meas) {
-        real lam = P.hand_acc * T * T / sigma_meas;
+        real err = len(e);
+        real spd = len(w);
+        // Suppress micro-vibration kicks (<0.8 deg at rest) while boosting real hand movement to 1.8x P.hand_acc
+        real activity = clamp01((err - 0.004) * 40.0 + spd * 0.8);
+        real dyn_acc = P.hand_acc * (0.18 + 1.62 * activity);
+
+        real lam = dyn_acc * T * T / sigma_meas;
         real r = (4.0 + lam - sqrt(8.0 * lam + lam * lam)) * 0.25;
-        real alpha = fmin(1.0 - r * r, 0.92);
-        real beta = fmin(fmax(2.0 * (1.0 + r * r) - 4.0 * r, 0.0), 0.85);
+
+        real max_alpha = 0.85 + 0.10 * activity; // Up to 0.95 on flicks
+        real max_beta  = 0.70 + 0.22 * activity; // Up to 0.92 on flicks
+        real alpha = fmin(1.0 - r * r, max_alpha);
+        real beta  = fmin(fmax(2.0 * (1.0 + r * r) - 4.0 * r, 0.0), max_beta);
+
         q = qnorm(qmul(q, qexp(e * alpha)));
         w = w + e * (beta / T);
     }
@@ -195,14 +232,14 @@ private:
 
     void restart() {
         inited = have_a = have_m = ref_valid = acc_seen = mag_seen = false;
-        w = {0.0, 0.0, 0.0}; reject_t = reject_tilt_t = 0.0;
+        w = lag = {0.0, 0.0, 0.0}; reject_t = reject_tilt_t = 0.0; t_pub = 0;
         out_x.store(0.0f, std::memory_order_relaxed);
         out_y.store(0.0f, std::memory_order_relaxed);
         out_z.store(0.0f, std::memory_order_relaxed);
     }
 
     void start(int64_t t) {
-        inited = true; w = {0.0, 0.0, 0.0}; t_last = t;
+        inited = true; w = lag = {0.0, 0.0, 0.0}; t_last = t_pub = t;
         acc_seen = mag_seen = false; reject_t = reject_tilt_t = 0.0;
         publish(t);
     }
@@ -265,7 +302,6 @@ static std::atomic<int32_t> g_gyro_type{ASENSOR_TYPE_GYROSCOPE};
 static std::atomic<int> own_state{0};
 static std::atomic_flag own_started = ATOMIC_FLAG_INIT;
 
-// State for synthetic packet injection & monotonic timestamping
 static int64_t g_last_gyro_ts = 0;
 static uint64_t g_last_emitted_seq = 0;
 static bool g_pending_synth = false;
@@ -291,7 +327,7 @@ static inline void write_synthetic_gyro(ASensorEvent& dst, int32_t handle, int32
 
     int64_t latest = vg.latest_ts.load(std::memory_order_relaxed);
     int64_t ts = (latest > base_ts) ? latest : base_ts;
-    if (ts <= g_last_gyro_ts) ts = g_last_gyro_ts + 100000; // Strictly monotonic (+0.1ms min step)
+    if (ts <= g_last_gyro_ts) ts = g_last_gyro_ts + 100000;
     g_last_gyro_ts = ts;
     dst.timestamp = ts;
 
@@ -353,7 +389,7 @@ static void* sensor_thread_main(void*) {
     ALooper* looper = looperPrepare(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS);
     ASensorEventQueue* q = looper ? createEventQueue(mgr, looper, VG_LOOPER_ID, nullptr, nullptr) : nullptr;
     const ASensor* acc = getDefaultSensor(mgr, ASENSOR_TYPE_ACCELEROMETER);
-    g_hw_accel = acc; // Save hardware accelerometer pointer for waking the game's gyro queue
+    g_hw_accel = acc;
     int mag_type = 14;
     const ASensor* mag = getDefaultSensor(mgr, 14);
     if (!mag) { mag_type = 2; mag = getDefaultSensor(mgr, 2); }
@@ -395,7 +431,6 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
         else own_state.store(-1, std::memory_order_relaxed);
     }
 
-    // 1-Shot synthetic packet delivery when the previous call had count == 1 and couldn't append
     if (__builtin_expect(g_pending_synth && queue == g_gyro_queue.load(std::memory_order_relaxed) && count >= 1, 0)) {
         g_pending_synth = false;
         int32_t handle = g_gyro_handle.load(std::memory_order_relaxed);
@@ -427,7 +462,6 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
             if (e.timestamp > batch_ts) batch_ts = e.timestamp;
 
             if (e.type == ASENSOR_TYPE_GYROSCOPE || e.type == 4 || e.type == ASENSOR_TYPE_GYROSCOPE_UNCALIBRATED || e.type == 16) {
-                // Capture handle & queue on first gyro packet, then hijack hardware Accel to clock this queue at 200Hz+
                 if (__builtin_expect(g_gyro_handle.load(std::memory_order_relaxed) == -1, 0)) {
                     g_gyro_handle.store(e.sensor, std::memory_order_relaxed);
                     g_gyro_type.store(e.type, std::memory_order_relaxed);
@@ -444,7 +478,6 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                 emitted_gyro_in_batch = true;
                 g_last_emitted_seq = vg.seq.load(std::memory_order_relaxed);
             } else if (e.type == ASENSOR_TYPE_ACCELEROMETER && is_gyro_q && !game_wants_acc) {
-                // Dedicated gyro queue woken up by our hijacked 200Hz+ hardware Accel: transmute in-place into a 0-delay Gyro packet!
                 int32_t handle = g_gyro_handle.load(std::memory_order_relaxed);
                 if (handle != -1) {
                     write_synthetic_gyro(e, handle, g_gyro_type.load(std::memory_order_relaxed), wx, wy, wz, e.timestamp);
@@ -454,7 +487,6 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
             }
         }
 
-        // Shared queue path: if woken by Accel and no Gyro packet was in this batch, inject a synthetic Gyro packet
         uint64_t cur_seq = vg.seq.load(std::memory_order_acquire);
         if (is_gyro_q && !emitted_gyro_in_batch && cur_seq != g_last_emitted_seq) {
             int32_t handle = g_gyro_handle.load(std::memory_order_relaxed);
@@ -464,14 +496,13 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
                     write_synthetic_gyro(events[n], handle, g_gyro_type.load(std::memory_order_relaxed), wx, wy, wz, batch_ts);
                     n++;
                 } else {
-                    g_pending_synth = true; // Will be emitted on the immediate next iteration of the game's while() loop
+                    g_pending_synth = true;
                 }
             }
         }
         return n;
     }
 
-    // Fallback path only if private sensor thread is not active
     std::lock_guard<std::mutex> lock(vg_lock);
     for (ssize_t i = 0; i < n; i++) {
         ASensorEvent& e = events[i];
