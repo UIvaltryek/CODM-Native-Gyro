@@ -9,77 +9,108 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <math.h>
+#include <cmath>
 #include <atomic>
 #include <mutex>
 #include "dobby.h"
 #include "zygisk.hpp"
 
-namespace gl {
+namespace vg {
 
-typedef double real;
-struct D3 { real x, y, z; };
+using Real = double;
+constexpr Real kPi = 3.14159265358979323846;
 
-static inline D3 operator+(D3 a, D3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
-static inline D3 operator-(D3 a, D3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
-static inline D3 operator*(D3 a, real s) { return {a.x * s, a.y * s, a.z * s}; }
-static inline real dot(D3 a, D3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-static inline D3 cross(D3 a, D3 b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
-static inline real len(D3 a) { return sqrt(dot(a, a)); }
-static inline real clamp01(real v) { return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v); }
+struct Vec3 { Real x = 0, y = 0, z = 0; };
+inline Vec3 operator+(const Vec3& a, const Vec3& b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
+inline Vec3 operator-(const Vec3& a, const Vec3& b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+inline Vec3 operator*(const Vec3& a, Real s)        { return {a.x * s, a.y * s, a.z * s}; }
+inline Real dot(const Vec3& a, const Vec3& b)       { return a.x * b.x + a.y * b.y + a.z * b.z; }
+inline Vec3 cross(const Vec3& a, const Vec3& b) {
+    return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+}
+inline Real norm(const Vec3& a) { return std::sqrt(dot(a, a)); }
 
-struct Quat { real w, x, y, z; };
-static inline Quat qmul(Quat a, Quat b) {
+struct Quat { Real w = 1, x = 0, y = 0, z = 0; };
+inline Quat operator*(const Quat& a, const Quat& b) {
     return {a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
             a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
             a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
             a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w};
 }
-static inline Quat qnorm(Quat a) {
-    real n = sqrt(a.w * a.w + a.x * a.x + a.y * a.y + a.z * a.z);
-    if (n < 1e-300) return {1.0, 0.0, 0.0, 0.0};
-    real s = 1.0 / n; return {a.w * s, a.x * s, a.y * s, a.z * s};
+inline Quat conj(const Quat& q) { return {q.w, -q.x, -q.y, -q.z}; }
+inline Quat normalized(const Quat& q) {
+    const Real n = std::sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
+    if (!(n > 1e-12)) return Quat{};
+    const Real k = 1.0 / n;
+    return {q.w * k, q.x * k, q.y * k, q.z * k};
 }
-static inline Quat qexp(D3 rv) {
-    real th = len(rv);
-    if (th < 1e-9) return qnorm({1.0, rv.x * 0.5, rv.y * 0.5, rv.z * 0.5});
-    real s = sin(th * 0.5) / th; return {cos(th * 0.5), rv.x * s, rv.y * s, rv.z * s};
+inline Vec3 rotate(const Quat& q, const Vec3& v) {
+    const Vec3 u{q.x, q.y, q.z};
+    const Vec3 t = cross(u, v) * 2.0;
+    return v + t * q.w + cross(u, t);
+}
+inline Vec3 rotateInv(const Quat& q, const Vec3& v) { return rotate(conj(q), v); }
+
+inline Quat expMap(const Vec3& phi) {
+    const Real a2 = dot(phi, phi);
+    Real s, c;
+    if (a2 < 1e-10) { s = 0.5 - a2 / 48.0; c = 1.0 - a2 / 8.0; }
+    else { const Real a = std::sqrt(a2); s = std::sin(0.5 * a) / a; c = std::cos(0.5 * a); }
+    return {c, phi.x * s, phi.y * s, phi.z * s};
+}
+inline Vec3 logMap(Quat q) {
+    if (q.w < 0) q = {-q.w, -q.x, -q.y, -q.z};
+    const Real s = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z);
+    const Real k = (s < 1e-9) ? 2.0 / q.w : 2.0 * std::atan2(s, q.w) / s;
+    return {q.x * k, q.y * k, q.z * k};
+}
+inline Vec3 arcVector(const Vec3& a, const Vec3& b) {
+    const Vec3 c = cross(a, b);
+    const Real s = norm(c), d = dot(a, b);
+    if (s > 1e-12) return c * (std::atan2(s, d) / s);
+    if (d > 0) return Vec3{};
+    const Real ax = std::fabs(a.x), ay = std::fabs(a.y), az = std::fabs(a.z);
+    const Vec3 e = (ax <= ay && ax <= az) ? Vec3{1, 0, 0} : (ay <= az ? Vec3{0, 1, 0} : Vec3{0, 0, 1});
+    const Vec3 p = cross(a, e);
+    return p * (kPi / norm(p));
+}
+inline Real clamp01(Real x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
+inline Real smoothstep(Real e0, Real e1, Real x) {
+    const Real t = clamp01((x - e0) / (e1 - e0));
+    return t * t * (3 - 2 * t);
 }
 
-static inline D3 row0(Quat q) { return {1 - 2 * (q.y * q.y + q.z * q.z), 2 * (q.x * q.y - q.w * q.z), 2 * (q.x * q.z + q.w * q.y)}; }
-static inline D3 row1(Quat q) { return {2 * (q.x * q.y + q.w * q.z), 1 - 2 * (q.x * q.x + q.z * q.z), 2 * (q.y * q.z - q.w * q.x)}; }
-static inline D3 up_in_dev(Quat q) { return {2 * (q.x * q.z - q.w * q.y), 2 * (q.y * q.z + q.w * q.x), 1 - 2 * (q.x * q.x + q.y * q.y)}; }
+struct Config {
+    Real gravity       = 9.80665;
+    // Raised noise floor so oscillating speaker/DAC vibrations stay below the EMA activity threshold
+    Real accelNoise    = 0.08;
+    Real magNoise      = 1.2;
 
-static Quat quat_from_rows(D3 r0, D3 r1, D3 r2) {
-    real R00 = r0.x, R01 = r0.y, R02 = r0.z, R10 = r1.x, R11 = r1.y, R12 = r1.z, R20 = r2.x, R21 = r2.y, R22 = r2.z;
-    real tr = R00 + R11 + R22; Quat q;
-    if (tr > 0.0)                      { real S = sqrt(tr + 1.0) * 2.0;                 q = {0.25 * S, (R21 - R12) / S, (R02 - R20) / S, (R10 - R01) / S}; }
-    else if (R00 > R11 && R00 > R22)   { real S = sqrt(1.0 + R00 - R11 - R22) * 2.0;   q = {(R21 - R12) / S, 0.25 * S, (R01 + R10) / S, (R02 + R20) / S}; }
-    else if (R11 > R22)                { real S = sqrt(1.0 + R11 - R00 - R22) * 2.0;   q = {(R02 - R20) / S, (R01 + R10) / S, 0.25 * S, (R12 + R21) / S}; }
-    else                               { real S = sqrt(1.0 + R22 - R00 - R11) * 2.0;   q = {(R10 - R01) / S, (R02 + R20) / S, (R12 + R21) / S, 0.25 * S}; }
-    return qnorm(q);
-}
+    // Tilt & Yaw bandwidths: ultra-calm at rest (no shooting jitter), wide-open on movement (~6-10ms response)
+    Real bwRest        = 5.0;
+    Real bwMax         = 160.0;
+    Real bwPerSpeed    = 85.0;
+    Real bwRestYaw     = 4.0;
+    Real bwMaxYaw      = 140.0;   // Matched to tilt so horizontal flicks never lag behind vertical
 
-static inline D3 rotvec_between(D3 u, D3 v) {
-    D3 c = cross(u, v); real s = len(c);
-    if (s < 1e-12) return {0.0, 0.0, 0.0};
-    return c * (atan2(s, dot(u, v)) / s);
-}
-static inline real soft_gate(real dev, real tol) { real x = dev / tol; return x >= 1.0 ? 0.0 : 1.0 - x * x; }
+    // Output follower: 1:1 angle lock without deadzone
+    Real outBwRest     = 5.0;
+    Real outBwPerSpeed = 500.0;
+    Real restDeadband  = 0.0;     // Zero deadzone for micro-aiming
 
-struct Params {
-    real sigma_tilt  = 0.04;
-    real sigma_head  = 0.04;
-    real hand_acc    = 135.0;
-    real g_tol       = 70.0;
-    real mag_tol     = 10.0;
-    real dip_tol     = 3.14159;
-    real jump_reject = 3.14159;
-    real tilt_reject = 3.14159;
-    real outage_tau  = 0.15;
-    real lock_hz     = 0.0;
-    real max_gap     = 1.0;
-    real mag_wait    = 0.5;
+    // Wide-open gates so high-G centripetal flicks and violent swipes are never rejected
+    Real accGateLo     = 3.5;
+    Real accGateHi     = 8.0;
+    Real outlierSigma  = 200.0;
+    Real maxAngAccel   = 25000.0;
+    Real innovLambda   = 0.35;
+    Real decayTau      = 0.15;
+    Real resyncAfter   = 0.30;
+    Real maxGap        = 1.0;
+    Real magStale      = 0.25;
+    Real magRefTau     = 4.0;
+    int  magWarmup     = 8;
+    Real magReanchor   = 1.5;
 };
 
 class VirtualGyro {
@@ -88,186 +119,219 @@ public:
     std::atomic<int64_t> latest_ts{0};
     std::atomic<uint64_t> seq{0};
 
-    explicit VirtualGyro(Params p = Params()) : P(p) { restart(); }
+    explicit VirtualGyro(const Config& cfg = Config()) : cfg_(cfg) { reset(); }
 
-    void on_accel(D3 a, int64_t t) {
-        real n = len(a); if (!(n > 1e-3)) return;
-        if (inited) advance(t);
-        if (!inited) { a0 = a; ta0 = t; if (!have_a) { have_a = true; ta_first = t; } try_init(t); return; }
-        real T = interval(t, t_acc, acc_seen); t_acc = t; acc_seen = true;
-        D3 up = up_in_dev(q);
-        D3 e = rotvec_between(a * (1.0 / n), up);
-        if (len(e) > P.tilt_reject) {
-            reject_tilt_t += T;
-            if (reject_tilt_t > 0.3) { restart(); a0 = a; ta0 = t; have_a = true; ta_first = t; return; }
-            decay(up, T, false); publish(t); return;
-        }
-        reject_tilt_t = 0.0;
-        real wa = soft_gate(fabs(n - G), P.g_tol);
-        if (wa < 0.02) { decay(up, T, false); publish(t); return; }
-        correct(e, T, P.sigma_tilt / sqrt(wa));
-        publish(t);
+    void reset() {
+        init_ = haveMagRef_ = havePending_ = false;
+        q_ = y_ = Quat{};
+        w_ = out_ = rhoAvgT_ = magPending_ = mwAvg_ = mwSum_ = Vec3{};
+        northRef_ = Vec3{0, 1, 0}; magWarm_ = 0;
+        tState_ = tAcc_ = tMag_ = 0;
+        actT_ = actY_ = psiAvg_ = refB_ = refDip_ = magBad_ = rejectTime_ = 0;
+        trustT_ = 1; trustY_ = 0;
+        gRef_ = cfg_.gravity;
+        out_x.store(0.0f, std::memory_order_relaxed);
+        out_y.store(0.0f, std::memory_order_relaxed);
+        out_z.store(0.0f, std::memory_order_relaxed);
     }
 
-    void on_mag(D3 m, int64_t t) {
-        real nm = len(m); if (!(nm > 1e-3)) return;
-        if (inited) advance(t);
-        if (!inited) { m0 = m; tm0 = t; have_m = true; try_init(t); return; }
-        real T = interval(t, t_mag, mag_seen); t_mag = t; mag_seen = true;
-        Quat q0 = q; D3 up = up_in_dev(q0);
-        real hx = dot(row0(q0), m), hy = dot(row1(q0), m);
-        real hn = sqrt(hx * hx + hy * hy);
-        real dip = acos(fmax(-1.0, fmin(1.0, dot(m, up) / nm)));
-        if (!ref_valid) {
-            if (hn >= 0.2 * nm) { h_refx = hx / hn; h_refy = hy / hn; m_ref = nm; dip_ref = dip; ref_valid = true; }
+    void onMag(int64_t tNs, Real mx, Real my, Real mz) {
+        const Vec3 m{mx, my, mz};
+        const Real mn = norm(m);
+        if (!std::isfinite(mn) || mn < 1.0) return;
+        if (!init_) { magPending_ = m; havePending_ = true; return; }
+        if (!haveMagRef_) { anchorMag(m); tMag_ = tNs; return; }
+
+        const Real T = (tNs - tMag_) * 1e-9;
+        if (T <= 0) return;
+        tMag_ = tNs;
+        if (T > cfg_.maxGap) return;
+        propagateTo(tNs);
+
+        const Vec3 up = rotateInv(q_, Vec3{0, 0, 1});
+        const Real mUp = dot(m, up);
+        const Vec3 mh = m - up * mUp;
+        const Real mhn = norm(mh);
+        const Real cd = mUp / mn;
+
+        if (magWarm_ < cfg_.magWarmup) {
+            mwSum_ = mwSum_ + rotate(q_, m);
+            ++magWarm_;
+            refreshNorthRef(mwSum_ * (1.0 / magWarm_), mn);
+            refB_ += (mn - refB_) / magWarm_;
+            refDip_ += (cd - refDip_) / magWarm_;
             return;
         }
-        real wgt = soft_gate(fabs(nm - m_ref) / m_ref, P.mag_tol) * soft_gate(fabs(dip - dip_ref), P.dip_tol);
-        if (hn < 0.2 * nm) wgt = 0.0;
-        real psi = 0.0;
-        if (wgt >= 0.02) {
-            psi = atan2(hx * h_refy - hy * h_refx, hx * h_refx + hy * h_refy);
-            if (fabs(psi) > P.jump_reject) wgt = 0.0;
+
+        // Expanded field gates so cross-axis bleed during wide flicks never blinds yaw
+        const Real eB = std::fabs(mn / refB_ - 1.0), eD = std::fabs(cd - refDip_);
+        const Real gate = (1.0 - smoothstep(2.0, 10.0, eB)) * (1.0 - smoothstep(1.5, 3.14, eD)) *
+                          smoothstep(0.05, 0.20, mhn / refB_);
+
+        const Vec3 mw = rotate(q_, m);
+        const bool steady = norm(mw - mwAvg_) < 0.05 * refB_;
+        mwAvg_ = mwAvg_ + (mw - mwAvg_) * (1.0 - std::exp(-T / 0.4));
+        if (gate > 0.9) { magBad_ = 0; }
+        else if (gate < 0.3 && steady) {
+            magBad_ += T;
+            if (magBad_ > cfg_.magReanchor) { anchorMag(m); magBad_ = 0; return; }
         }
-        if (wgt < 0.02) {
-            reject_t += T;
-            if (reject_t > 0.5 && hn >= 0.2 * nm) {
-                h_refx = hx / hn; h_refy = hy / hn; m_ref = nm; dip_ref = dip; reject_t = 0.0;
-            }
-            decay(up, T, true); publish(t);
-            return;
+
+        if (mhn < 1e-6) return;
+        const Vec3 north = rotateInv(q_, northRef_);
+        const Vec3 hm = mh * (1.0 / mhn);
+        const Real psi = std::atan2(dot(up, cross(hm, north)), dot(north, hm));
+
+        const Real sigma = 1.25 * cfg_.magNoise / mhn;
+        const Real scale = cfg_.outlierSigma * sigma + cfg_.maxAngAccel * T * T;
+        const Real sur = std::fabs(psi - psiAvg_) / scale;
+        const Real wRob = 1.0 / (1.0 + sur * sur);
+        const Real psiW = psi * wRob;
+        psiAvg_ += (psiW - psiAvg_) * cfg_.innovLambda;
+        const Real fEma = 3.0 * sigma * std::sqrt(cfg_.innovLambda / (2.0 - cfg_.innovLambda));
+        actY_ = std::fmax(std::fmax(0.0, std::fabs(psiAvg_) - fEma),
+                          std::fmax(0.0, std::fabs(psiW) - 3.5 * sigma)) / T;
+
+        // Decoupled from trustT_ so high-G wrist flicks never blind horizontal turning
+        const Real trust = gate * wRob;
+        trustY_ += (trust - trustY_) * 0.5;
+        if (gate > 0.9) {
+            const Real k = 1.0 - std::exp(-T / cfg_.magRefTau);
+            refB_ += (mn - refB_) * k;
+            refDip_ += (cd - refDip_) * k;
         }
-        reject_t = 0.0;
-        correct(up * psi, T, P.sigma_head / sqrt(wgt));
-        if (wgt > 0.9) {
-            real k = fmin(1.0, T * 0.05);
-            m_ref += k * (nm - m_ref); dip_ref += k * (dip - dip_ref);
-        }
-        publish(t);
+        const Real speed = norm(w_) + actT_ + actY_;
+        const Real bw = std::fmin(cfg_.bwMaxYaw, cfg_.bwRestYaw + cfg_.bwPerSpeed * speed);
+        correct(up * psi, T, trust, bw);
+    }
+
+    void onAccel(int64_t tNs, Real ax, Real ay, Real az) {
+        const Vec3 a{ax, ay, az};
+        const Real an = norm(a);
+        if (!std::isfinite(an) || an < 0.1 * gRef_) return;
+        const Vec3 u = a * (1.0 / an);
+
+        if (!init_) { start(tNs, u); return; }
+        const Real T = (tNs - tAcc_) * 1e-9;
+        if (T <= 0) return;
+        if (T > cfg_.maxGap) { reseat(tNs, u); return; }
+
+        propagateTo(tNs);
+        const Vec3 up0 = rotateInv(q_, Vec3{0, 0, 1});
+        const Vec3 rho = arcVector(u, up0);
+
+        const Real eMag = std::fabs(an - gRef_) / gRef_;
+        const Real gMag = 1.0 - smoothstep(cfg_.accGateLo, cfg_.accGateHi, eMag);
+        const Real sigma = 1.25 * cfg_.accelNoise / an;
+        const Real scale = cfg_.outlierSigma * sigma + cfg_.maxAngAccel * T * T;
+        const Real sur = norm(rho - rhoAvgT_) / scale;
+        const Real wRob = 1.0 / (1.0 + sur * sur);
+        const Real trust = gMag * wRob;
+
+        rejectTime_ = (wRob < 0.2 && gMag > 0.9) ? rejectTime_ + T : 0.0;
+        if (rejectTime_ > cfg_.resyncAfter) { reseat(tNs, u); return; }
+
+        const Vec3 rhoW = rho * wRob;
+        rhoAvgT_ = rhoAvgT_ + (rhoW - rhoAvgT_) * cfg_.innovLambda;
+        const Real fEma = 3.0 * sigma * std::sqrt(cfg_.innovLambda / (2.0 - cfg_.innovLambda));
+        actT_ = std::fmax(std::fmax(0.0, norm(rhoAvgT_) - fEma),
+                          std::fmax(0.0, norm(rhoW) - 4.0 * sigma)) / T;
+
+        const Real speed = norm(w_) + actT_ + actY_;
+        const Real bw = std::fmin(cfg_.bwMax, cfg_.bwRest + cfg_.bwPerSpeed * speed);
+        correct(rho, T, trust, bw);
+
+        trustT_ += (trust - trustT_) * (1.0 - std::exp(-T / 0.03));
+        if (eMag < 0.05 && norm(w_) < 0.2)
+            gRef_ += (an - gRef_) * (1.0 - std::exp(-T / 3.0));
+
+        const Real yawFresh = ((tNs - tMag_) * 1e-9 < cfg_.magStale) ? trustY_ : 0.0;
+        decay(rotateInv(q_, Vec3{0, 0, 1}), trustT_, yawFresh, T);
+
+        tAcc_ = tNs;
+        Vec3 w_out = emit(T);
+        publish(w_out, tNs);
     }
 
 private:
-    static constexpr real G = 9.80665;
-    static constexpr real kDeg = 57.29577951308232;
-    static constexpr real kTwoPi = 6.283185307179586;
+    Config cfg_;
+    bool init_, haveMagRef_, havePending_;
+    Quat q_, y_;
+    Vec3 w_, out_, rhoAvgT_, magPending_, mwAvg_, mwSum_, northRef_;
+    int magWarm_ = 0;
+    int64_t tState_, tAcc_, tMag_;
+    Real actT_, actY_, psiAvg_, refB_, refDip_, magBad_, rejectTime_, trustT_, trustY_, gRef_;
 
-    Params P;
-    Quat q{1.0, 0.0, 0.0, 0.0};
-    D3 w{0.0, 0.0, 0.0}, lag{0.0, 0.0, 0.0}, a0{0.0, 0.0, 0.0}, m0{0.0, 0.0, 0.0};
-    bool inited = false, have_a = false, have_m = false, ref_valid = false, acc_seen = false, mag_seen = false;
-    int64_t t_last = 0, t_pub = 0, t_acc = 0, t_mag = 0, ta0 = 0, tm0 = 0, ta_first = 0;
-    real m_ref = 0.0, dip_ref = 0.0, h_refx = 0.0, h_refy = 1.0, reject_t = 0.0, reject_tilt_t = 0.0;
-
-    // Stage 2: Angle-conserving 1-Euro smoother (1:1 total angle, ~10ms stationary smoothing, <1ms flick delay)
-    inline void publish(int64_t t) {
-        int64_t prev_t = t_pub;
-        if (t > prev_t) {
-            real dt = (t - prev_t) * 1e-9;
-            t_pub = t;
-            if (dt > 1e-4 && dt < 0.1) {
-                real spd_dps = len(w) * kDeg;
-                // 15 Hz at rest (kills 200Hz speaker/DAC buzz); scales by +2.5 Hz per deg/s for instant flicks
-                real fc = 15.0 + 2.5 * spd_dps;
-                real alpha = 1.0 - exp(-kTwoPi * fc * dt);
-                lag = lag + w * dt;
-                D3 dTheta = lag * alpha;
-                lag = lag - dTheta;
-                D3 w_out = dTheta * (1.0 / dt);
-
-                out_x.store((float)w_out.x, std::memory_order_relaxed);
-                out_y.store((float)w_out.y, std::memory_order_relaxed);
-                out_z.store((float)w_out.z, std::memory_order_relaxed);
-            } else {
-                lag = {0.0, 0.0, 0.0};
-                out_x.store((float)w.x, std::memory_order_relaxed);
-                out_y.store((float)w.y, std::memory_order_relaxed);
-                out_z.store((float)w.z, std::memory_order_relaxed);
-            }
-        }
+    inline void publish(const Vec3& w_out, int64_t t) {
+        out_x.store((float)w_out.x, std::memory_order_relaxed);
+        out_y.store((float)w_out.y, std::memory_order_relaxed);
+        out_z.store((float)w_out.z, std::memory_order_relaxed);
         if (t > latest_ts.load(std::memory_order_relaxed)) {
             latest_ts.store(t, std::memory_order_relaxed);
         }
         seq.fetch_add(1, std::memory_order_release);
     }
 
-    static inline real interval(int64_t t, int64_t prev, bool seen) {
-        if (!seen) return 0.005;
-        real T = (t - prev) * 1e-9;
-        return T < 1e-3 ? 1e-3 : (T > 0.1 ? 0.1 : T);
+    void start(int64_t tNs, const Vec3& u) {
+        q_ = normalized(expMap(arcVector(u, Vec3{0, 0, 1})));
+        y_ = q_; w_ = out_ = Vec3{};
+        tState_ = tAcc_ = tNs; init_ = true;
+        if (havePending_) { anchorMag(magPending_); tMag_ = tNs; havePending_ = false; }
+        publish(out_, tNs);
     }
-
-    // Stage 1: Innovation-Adaptive Kalman update
-    inline void correct(D3 e, real T, real sigma_meas) {
-        real err = len(e);
-        real spd = len(w);
-        // Suppress micro-vibration kicks (<0.8 deg at rest) while boosting real hand movement to 1.8x P.hand_acc
-        real activity = clamp01((err - 0.004) * 40.0 + spd * 0.8);
-        real dyn_acc = P.hand_acc * (0.18 + 1.62 * activity);
-
-        real lam = dyn_acc * T * T / sigma_meas;
-        real r = (4.0 + lam - sqrt(8.0 * lam + lam * lam)) * 0.25;
-
-        real max_alpha = 0.85 + 0.10 * activity; // Up to 0.95 on flicks
-        real max_beta  = 0.70 + 0.22 * activity; // Up to 0.92 on flicks
-        real alpha = fmin(1.0 - r * r, max_alpha);
-        real beta  = fmin(fmax(2.0 * (1.0 + r * r) - 4.0 * r, 0.0), max_beta);
-
-        q = qnorm(qmul(q, qexp(e * alpha)));
-        w = w + e * (beta / T);
+    void reseat(int64_t tNs, const Vec3& u) {
+        q_ = normalized(q_ * expMap(arcVector(u, rotateInv(q_, Vec3{0, 0, 1}))));
+        y_ = q_; w_ = out_ = rhoAvgT_ = Vec3{};
+        actT_ = actY_ = psiAvg_ = rejectTime_ = 0;
+        tState_ = tAcc_ = tNs;
+        publish(out_, tNs);
     }
-
-    inline void decay(D3 g, real T, bool along) {
-        real k = exp(-T / P.outage_tau);
-        D3 par = g * dot(w, g);
-        w = along ? (par * k + (w - par)) : (par + (w - par) * k);
+    void refreshNorthRef(const Vec3& mWorld, Real mn) {
+        const Vec3 h{mWorld.x, mWorld.y, 0.0};
+        const Real hn = norm(h);
+        if (hn > 0.1 * mn) northRef_ = h * (1.0 / hn);
+        mwAvg_ = mWorld;
     }
-
-    inline void advance(int64_t t) {
-        if (t <= t_last) return;
-        real dt = (t - t_last) * 1e-9;
-        if (dt > P.max_gap) { restart(); return; }
-        q = qnorm(qmul(q, qexp(w * dt)));
-        t_last = t;
+    void anchorMag(const Vec3& m) {
+        const Vec3 up = rotateInv(q_, Vec3{0, 0, 1});
+        const Real mn = norm(m);
+        refB_ = mn; refDip_ = dot(m, up) / mn;
+        mwSum_ = rotate(q_, m); magWarm_ = 1;
+        refreshNorthRef(mwSum_, mn);
+        psiAvg_ = 0; magBad_ = 0; haveMagRef_ = true;
     }
-
-    void restart() {
-        inited = have_a = have_m = ref_valid = acc_seen = mag_seen = false;
-        w = lag = {0.0, 0.0, 0.0}; reject_t = reject_tilt_t = 0.0; t_pub = 0;
-        out_x.store(0.0f, std::memory_order_relaxed);
-        out_y.store(0.0f, std::memory_order_relaxed);
-        out_z.store(0.0f, std::memory_order_relaxed);
+    void propagateTo(int64_t tNs) {
+        const Real dt = (tNs - tState_) * 1e-9;
+        if (dt <= 0) return;
+        q_ = normalized(q_ * expMap(w_ * dt));
+        tState_ = tNs;
     }
-
-    void start(int64_t t) {
-        inited = true; w = lag = {0.0, 0.0, 0.0}; t_last = t_pub = t;
-        acc_seen = mag_seen = false; reject_t = reject_tilt_t = 0.0;
-        publish(t);
+    void correct(const Vec3& rho, Real T, Real trust, Real bw) {
+        const Real th = std::exp(-bw * T);
+        const Real a = (1.0 - th * th) * trust;
+        const Real b = (1.0 - th) * (1.0 - th) * trust;
+        q_ = normalized(q_ * expMap(rho * a));
+        w_ = w_ + rho * (b / T);
     }
-
-    void try_init(int64_t t) {
-        if (have_a && have_m) {
-            real an = len(a0), mn = len(m0);
-            D3 east = cross(m0, a0); real en = len(east);
-            if (en < 1e-3 * an * mn) return;
-            east = east * (1.0 / en);
-            D3 up = a0 * (1.0 / an), north = cross(up, east);
-            q = quat_from_rows(east, north, up);
-            m_ref = mn; dip_ref = acos(fmax(-1.0, fmin(1.0, dot(m0, a0) / (mn * an))));
-            h_refx = 0.0; h_refy = 1.0; ref_valid = true;
-            start(ta0 > tm0 ? ta0 : tm0);
-        } else if (have_a && (t - ta_first) * 1e-9 > P.mag_wait) {
-            real an = len(a0); D3 up = a0 * (1.0 / an);
-            D3 ex = {1.0, 0.0, 0.0};
-            D3 r0 = ex - up * dot(ex, up);
-            if (len(r0) < 0.3) { ex = {0.0, 1.0, 0.0}; r0 = ex - up * dot(ex, up); }
-            r0 = r0 * (1.0 / len(r0));
-            q = quat_from_rows(r0, cross(up, r0), up);
-            ref_valid = false; start(ta0);
-        }
+    void decay(const Vec3& up, Real trustPerp, Real trustPar, Real T) {
+        const Real kp = std::exp(-(1.0 - trustPerp) * T / cfg_.decayTau);
+        const Real kq = std::exp(-(1.0 - trustPar) * T / cfg_.decayTau);
+        const Vec3 par = up * dot(w_, up);
+        w_ = (w_ - par) * kp + par * kq;
+    }
+    Vec3 emit(Real T) {
+        const Real speed = norm(w_) + actT_ + actY_;
+        const Quat yPred = y_ * expMap(w_ * T);
+        const Vec3 e = logMap(conj(yPred) * q_);
+        const Real mu = 1.0 - std::exp(-(cfg_.outBwRest + cfg_.outBwPerSpeed * speed) * T);
+        Vec3 out = w_ + e * (mu / T);
+        if (cfg_.restDeadband > 0) out = out * smoothstep(cfg_.restDeadband, 2 * cfg_.restDeadband, norm(out));
+        y_ = normalized(y_ * expMap(out * T));
+        return out_ = out;
     }
 };
 
-}  // namespace gl
+}  // namespace vg
 
 // =====================================================================================================
 // SYNTHETIC 0-DELAY PACKET GENERATOR & HARDWARE ACCEL CLOCK HIJACKING
@@ -277,7 +341,7 @@ static constexpr float HARD_IRON_X = 93.76f;
 static constexpr float HARD_IRON_Y = -29.09f;
 static constexpr float HARD_IRON_Z = 967.01f;
 
-static gl::VirtualGyro vg;
+static vg::VirtualGyro gyro_engine;
 static std::mutex vg_lock;
 
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
@@ -307,15 +371,16 @@ static uint64_t g_last_emitted_seq = 0;
 static bool g_pending_synth = false;
 
 static inline void feed_accel(const ASensorEvent& e) {
-    vg.on_accel({e.acceleration.x, e.acceleration.y, e.acceleration.z}, e.timestamp);
+    gyro_engine.onAccel(e.timestamp, e.acceleration.x, e.acceleration.y, e.acceleration.z);
 }
 static inline void feed_mag_uncal(const ASensorEvent& e) {
-    vg.on_mag({e.uncalibrated_magnetic.x_uncalib - HARD_IRON_X,
-               e.uncalibrated_magnetic.y_uncalib - HARD_IRON_Y,
-               e.uncalibrated_magnetic.z_uncalib - HARD_IRON_Z}, e.timestamp);
+    gyro_engine.onMag(e.timestamp,
+                      e.uncalibrated_magnetic.x_uncalib - HARD_IRON_X,
+                      e.uncalibrated_magnetic.y_uncalib - HARD_IRON_Y,
+                      e.uncalibrated_magnetic.z_uncalib - HARD_IRON_Z);
 }
 static inline void feed_mag_cal(const ASensorEvent& e) {
-    vg.on_mag({e.magnetic.x, e.magnetic.y, e.magnetic.z}, e.timestamp);
+    gyro_engine.onMag(e.timestamp, e.magnetic.x, e.magnetic.y, e.magnetic.z);
 }
 
 static inline void write_synthetic_gyro(ASensorEvent& dst, int32_t handle, int32_t type, float wx, float wy, float wz, int64_t base_ts) {
@@ -325,7 +390,7 @@ static inline void write_synthetic_gyro(ASensorEvent& dst, int32_t handle, int32
     dst.type = type;
     dst.gyro.status = ASENSOR_STATUS_ACCURACY_HIGH;
 
-    int64_t latest = vg.latest_ts.load(std::memory_order_relaxed);
+    int64_t latest = gyro_engine.latest_ts.load(std::memory_order_relaxed);
     int64_t ts = (latest > base_ts) ? latest : base_ts;
     if (ts <= g_last_gyro_ts) ts = g_last_gyro_ts + 100000;
     g_last_gyro_ts = ts;
@@ -435,10 +500,10 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
         g_pending_synth = false;
         int32_t handle = g_gyro_handle.load(std::memory_order_relaxed);
         if (handle != -1) {
-            const float wx = vg.out_x.load(std::memory_order_relaxed);
-            const float wy = vg.out_y.load(std::memory_order_relaxed);
-            const float wz = vg.out_z.load(std::memory_order_relaxed);
-            write_synthetic_gyro(events[0], handle, g_gyro_type.load(std::memory_order_relaxed), wx, wy, wz, vg.latest_ts.load(std::memory_order_relaxed));
+            const float wx = gyro_engine.out_x.load(std::memory_order_relaxed);
+            const float wy = gyro_engine.out_y.load(std::memory_order_relaxed);
+            const float wz = gyro_engine.out_z.load(std::memory_order_relaxed);
+            write_synthetic_gyro(events[0], handle, g_gyro_type.load(std::memory_order_relaxed), wx, wy, wz, gyro_engine.latest_ts.load(std::memory_order_relaxed));
             return 1;
         }
     }
@@ -448,9 +513,9 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
 
     const int state = own_state.load(std::memory_order_acquire);
     if (__builtin_expect(state == 1, 1)) {
-        const float wx = vg.out_x.load(std::memory_order_relaxed);
-        const float wy = vg.out_y.load(std::memory_order_relaxed);
-        const float wz = vg.out_z.load(std::memory_order_relaxed);
+        const float wx = gyro_engine.out_x.load(std::memory_order_relaxed);
+        const float wy = gyro_engine.out_y.load(std::memory_order_relaxed);
+        const float wz = gyro_engine.out_z.load(std::memory_order_relaxed);
         const bool is_gyro_q = (queue == g_gyro_queue.load(std::memory_order_relaxed));
         const bool game_wants_acc = g_game_wants_accel_on_gyro_q.load(std::memory_order_relaxed);
 
@@ -476,18 +541,18 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
 
                 write_synthetic_gyro(e, e.sensor, e.type, wx, wy, wz, e.timestamp);
                 emitted_gyro_in_batch = true;
-                g_last_emitted_seq = vg.seq.load(std::memory_order_relaxed);
+                g_last_emitted_seq = gyro_engine.seq.load(std::memory_order_relaxed);
             } else if (e.type == ASENSOR_TYPE_ACCELEROMETER && is_gyro_q && !game_wants_acc) {
                 int32_t handle = g_gyro_handle.load(std::memory_order_relaxed);
                 if (handle != -1) {
                     write_synthetic_gyro(e, handle, g_gyro_type.load(std::memory_order_relaxed), wx, wy, wz, e.timestamp);
                     emitted_gyro_in_batch = true;
-                    g_last_emitted_seq = vg.seq.load(std::memory_order_relaxed);
+                    g_last_emitted_seq = gyro_engine.seq.load(std::memory_order_relaxed);
                 }
             }
         }
 
-        uint64_t cur_seq = vg.seq.load(std::memory_order_acquire);
+        uint64_t cur_seq = gyro_engine.seq.load(std::memory_order_acquire);
         if (is_gyro_q && !emitted_gyro_in_batch && cur_seq != g_last_emitted_seq) {
             int32_t handle = g_gyro_handle.load(std::memory_order_relaxed);
             if (handle != -1) {
@@ -511,9 +576,9 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
         } else if (e.type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || e.type == 14) {
             feed_mag_uncal(e);
         } else if (e.type == ASENSOR_TYPE_GYROSCOPE || e.type == 4 || e.type == ASENSOR_TYPE_GYROSCOPE_UNCALIBRATED || e.type == 16) {
-            const float wx = vg.out_x.load(std::memory_order_relaxed);
-            const float wy = vg.out_y.load(std::memory_order_relaxed);
-            const float wz = vg.out_z.load(std::memory_order_relaxed);
+            const float wx = gyro_engine.out_x.load(std::memory_order_relaxed);
+            const float wy = gyro_engine.out_y.load(std::memory_order_relaxed);
+            const float wz = gyro_engine.out_z.load(std::memory_order_relaxed);
             write_synthetic_gyro(e, e.sensor, e.type, wx, wy, wz, e.timestamp);
         }
     }
