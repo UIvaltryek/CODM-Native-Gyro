@@ -7,6 +7,7 @@
 #include <sys/prctl.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -158,7 +159,6 @@ private:
     int64_t t_last = 0, t_pub = 0, t_acc = 0, t_mag = 0, ta0 = 0, tm0 = 0, ta_first = 0;
     real m_ref = 0.0, dip_ref = 0.0, h_refx = 0.0, h_refy = 1.0, reject_t = 0.0, reject_tilt_t = 0.0;
 
-    // Stage 2: Angle-conserving 1-Euro smoother (1:1 total angle, ~10ms stationary smoothing, <1ms flick delay)
     inline void publish(int64_t t) {
         int64_t prev_t = t_pub;
         if (t > prev_t) {
@@ -166,7 +166,6 @@ private:
             t_pub = t;
             if (dt > 1e-4 && dt < 0.1) {
                 real spd_dps = len(w) * kDeg;
-                // 15 Hz at rest (kills 200Hz speaker/DAC buzz); scales by +2.5 Hz per deg/s for instant flicks
                 real fc = 15.0 + 2.5 * spd_dps;
                 real alpha = 1.0 - exp(-kTwoPi * fc * dt);
                 lag = lag + w * dt;
@@ -196,19 +195,17 @@ private:
         return T < 1e-3 ? 1e-3 : (T > 0.1 ? 0.1 : T);
     }
 
-    // Stage 1: Innovation-Adaptive Kalman update
     inline void correct(D3 e, real T, real sigma_meas) {
         real err = len(e);
         real spd = len(w);
-        // Suppress micro-vibration kicks (<0.8 deg at rest) while boosting real hand movement to 1.8x P.hand_acc
         real activity = clamp01((err - 0.004) * 40.0 + spd * 0.8);
         real dyn_acc = P.hand_acc * (0.18 + 1.62 * activity);
 
         real lam = dyn_acc * T * T / sigma_meas;
         real r = (4.0 + lam - sqrt(8.0 * lam + lam * lam)) * 0.25;
 
-        real max_alpha = 0.90 + 0.10 * activity; // Up to 0.95 on flicks
-        real max_beta  = 0.80 + 0.20 * activity; // Up to 0.92 on flicks
+        real max_alpha = 0.85 + 0.10 * activity;
+        real max_beta  = 0.70 + 0.22 * activity;
         real alpha = fmin(1.0 - r * r, max_alpha);
         real beta  = fmin(fmax(2.0 * (1.0 + r * r) - 4.0 * r, 0.0), max_beta);
 
@@ -270,7 +267,7 @@ private:
 }  // namespace gl
 
 // =====================================================================================================
-// SYNTHETIC 0-DELAY PACKET GENERATOR & HARDWARE ACCEL CLOCK HIJACKING
+// UNIFIED NDK (CODM) + JAVA / LIBSENSOR (BGMI) ZERO-DELAY PIPELINE
 // =====================================================================================================
 
 static constexpr float HARD_IRON_X = 93.76f;
@@ -280,22 +277,48 @@ static constexpr float HARD_IRON_Z = 967.01f;
 static gl::VirtualGyro vg;
 static std::mutex vg_lock;
 
+// NDK (libandroid.so) function types
 typedef ssize_t (*getEvents_t)(ASensorEventQueue*, ASensorEvent*, size_t);
 typedef int (*setEventRate_t)(ASensorEventQueue*, ASensor const*, int32_t);
 typedef int (*registerSensor_t)(ASensorEventQueue*, ASensor const*, int32_t, int64_t);
 typedef int (*enableSensor_t)(ASensorEventQueue*, ASensor const*);
 typedef int (*getSensorType_t)(ASensor const*);
+typedef int (*getSensorHandle_t)(ASensor const*);
+typedef int (*getSensorList_t)(ASensorManager*, ASensorList*);
+
+// Core C++ SensorEventQueue (libsensor.so) function types (shared by Java SensorManager & NDK)
+typedef ssize_t (*seq_read_t)(void*, ASensorEvent*, size_t);
+typedef int (*seq_enableSensor_t)(const void*, int32_t, int32_t, int64_t, int);
+typedef int (*seq_enableSensorPtr_t)(const void*, const void*, int32_t);
+typedef int (*seq_setEventRate_t)(const void*, const void*, int64_t);
+
+// JNI CallVoidMethodV function type (for Java SystemSensorManager$SensorEventQueue.dispatchSensorEvent)
+typedef void (*CallVoidMethodV_t)(JNIEnv*, jobject, jmethodID, va_list);
 
 static getEvents_t orig_getEvents = nullptr;
 static setEventRate_t orig_setEventRate = nullptr;
 static registerSensor_t orig_registerSensor = nullptr;
 static enableSensor_t orig_enableSensor = nullptr;
 static getSensorType_t fn_getSensorType = nullptr;
+static getSensorHandle_t fn_getSensorHandle = nullptr;
+
+static seq_read_t orig_seq_read = nullptr;
+static seq_enableSensor_t orig_seq_enableSensor = nullptr;
+static seq_enableSensorPtr_t orig_seq_enableSensorPtr = nullptr;
+static seq_setEventRate_t orig_seq_setEventRate = nullptr;
+
+static CallVoidMethodV_t orig_CallVoidMethodV = nullptr;
+static jmethodID g_dispatchSensorEvent_mid = nullptr;
 
 static const ASensor* g_hw_accel = nullptr;
-static std::atomic<ASensorEventQueue*> g_gyro_queue{nullptr};
+static std::atomic<void*> g_own_queue{nullptr};
+static std::atomic<void*> g_gyro_queue{nullptr};
 static std::atomic<bool> g_game_wants_accel_on_gyro_q{false};
 static std::atomic<bool> g_hijacked_accel_clock{false};
+
+static std::atomic<int32_t> g_acc_handle{-1};
+static std::atomic<int32_t> g_gyro4_handle{-1};
+static std::atomic<int32_t> g_gyro16_handle{-1};
 static std::atomic<int32_t> g_gyro_handle{-1};
 static std::atomic<int32_t> g_gyro_type{ASENSOR_TYPE_GYROSCOPE};
 
@@ -305,6 +328,14 @@ static std::atomic_flag own_started = ATOMIC_FLAG_INIT;
 static int64_t g_last_gyro_ts = 0;
 static uint64_t g_last_emitted_seq = 0;
 static bool g_pending_synth = false;
+static thread_local bool g_in_ndk_get_events = false;
+
+static inline bool is_gyro_handle(int32_t h) {
+    if (h < 0) return false;
+    return h == g_gyro_handle.load(std::memory_order_relaxed) ||
+           h == g_gyro4_handle.load(std::memory_order_relaxed) ||
+           h == g_gyro16_handle.load(std::memory_order_relaxed);
+}
 
 static inline void feed_accel(const ASensorEvent& e) {
     vg.on_accel({e.acceleration.x, e.acceleration.y, e.acceleration.z}, e.timestamp);
@@ -366,6 +397,7 @@ static void* sensor_thread_main(void*) {
     auto getInstanceForPackage = (ASensorManager* (*)(const char*))dlsym(lib, "ASensorManager_getInstanceForPackage");
     auto getInstance           = (ASensorManager* (*)())dlsym(lib, "ASensorManager_getInstance");
     auto getDefaultSensor      = (const ASensor* (*)(ASensorManager*, int))dlsym(lib, "ASensorManager_getDefaultSensor");
+    auto getSensorList         = (getSensorList_t)dlsym(lib, "ASensorManager_getSensorList");
     auto looperPrepare         = (ALooper* (*)(int))dlsym(lib, "ALooper_prepare");
     auto createEventQueue      = (ASensorEventQueue* (*)(ASensorManager*, ALooper*, int, ALooper_callbackFunc, void*))dlsym(lib, "ASensorManager_createEventQueue");
     auto pollOnce              = (int (*)(int, int*, int*, void**))dlsym(lib, "ALooper_pollOnce");
@@ -386,8 +418,28 @@ static void* sensor_thread_main(void*) {
     if (!mgr && getInstance) mgr = getInstance();
     if (!mgr) { own_state.store(-1, std::memory_order_relaxed); return nullptr; }
 
+    // Pre-map hardware sensor handles so Java/libsensor enableSensor knows which handle is Gyro vs Accel immediately
+    if (getSensorList && fn_getSensorType && fn_getSensorHandle) {
+        ASensorList list = nullptr;
+        int scount = getSensorList(mgr, &list);
+        for (int i = 0; i < scount; i++) {
+            int t = fn_getSensorType(list[i]);
+            int h = fn_getSensorHandle(list[i]);
+            if (t == ASENSOR_TYPE_ACCELEROMETER && g_acc_handle.load(std::memory_order_relaxed) == -1) {
+                g_acc_handle.store(h, std::memory_order_relaxed);
+            } else if ((t == ASENSOR_TYPE_GYROSCOPE || t == 4) && g_gyro4_handle.load(std::memory_order_relaxed) == -1) {
+                g_gyro4_handle.store(h, std::memory_order_relaxed);
+                if (g_gyro_handle.load(std::memory_order_relaxed) == -1) g_gyro_handle.store(h, std::memory_order_relaxed);
+            } else if ((t == ASENSOR_TYPE_GYROSCOPE_UNCALIBRATED || t == 16) && g_gyro16_handle.load(std::memory_order_relaxed) == -1) {
+                g_gyro16_handle.store(h, std::memory_order_relaxed);
+            }
+        }
+    }
+
     ALooper* looper = looperPrepare(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS);
     ASensorEventQueue* q = looper ? createEventQueue(mgr, looper, VG_LOOPER_ID, nullptr, nullptr) : nullptr;
+    g_own_queue.store(q, std::memory_order_release);
+
     const ASensor* acc = getDefaultSensor(mgr, ASENSOR_TYPE_ACCELEROMETER);
     g_hw_accel = acc;
     int mag_type = 14;
@@ -406,6 +458,16 @@ static void* sensor_thread_main(void*) {
     setEventRate(q, mag, 0);
     own_state.store(1, std::memory_order_release);
 
+    // If the game already registered a gyro queue before our thread finished starting, hijack its clock now
+    void* game_q = g_gyro_queue.load(std::memory_order_relaxed);
+    if (game_q && !g_hijacked_accel_clock.load(std::memory_order_relaxed)) {
+        int32_t acc_h = g_acc_handle.load(std::memory_order_relaxed);
+        if (orig_seq_enableSensor && acc_h != -1) {
+            g_hijacked_accel_clock.store(true, std::memory_order_relaxed);
+            orig_seq_enableSensor(game_q, acc_h, 0, 0, 0);
+        }
+    }
+
     ASensorEvent ev[64];
     for (;;) {
         int ident = pollOnce(500, nullptr, nullptr, nullptr);
@@ -414,9 +476,16 @@ static void* sensor_thread_main(void*) {
         ssize_t n;
         while ((n = getEvents(q, ev, 64)) > 0) {
             for (ssize_t i = 0; i < n; i++) {
-                if (ev[i].type == ASENSOR_TYPE_ACCELEROMETER) { feed_accel(ev[i]); }
-                else if (mag_type == 14 && ev[i].type == 14)  { feed_mag_uncal(ev[i]); }
-                else if (mag_type == 2 && ev[i].type == 2)    { feed_mag_cal(ev[i]); }
+                if (ev[i].type == ASENSOR_TYPE_ACCELEROMETER) {
+                    if (__builtin_expect(g_acc_handle.load(std::memory_order_relaxed) == -1, 0)) {
+                        g_acc_handle.store(ev[i].sensor, std::memory_order_relaxed);
+                    }
+                    feed_accel(ev[i]);
+                } else if (mag_type == 14 && ev[i].type == 14) {
+                    feed_mag_uncal(ev[i]);
+                } else if (mag_type == 2 && ev[i].type == 2) {
+                    feed_mag_cal(ev[i]);
+                }
             }
         }
     }
@@ -424,12 +493,32 @@ static void* sensor_thread_main(void*) {
     return nullptr;
 }
 
-ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent* events, size_t count) {
+static inline void ensure_sensor_thread_started() {
     if (__builtin_expect(!own_started.test_and_set(std::memory_order_relaxed), 0)) {
         pthread_t th;
         if (pthread_create(&th, nullptr, sensor_thread_main, nullptr) == 0) pthread_detach(th);
         else own_state.store(-1, std::memory_order_relaxed);
     }
+}
+
+static inline void hijack_accel_on_queue(void* queue) {
+    if (g_hijacked_accel_clock.load(std::memory_order_relaxed)) return;
+    int32_t acc_h = g_acc_handle.load(std::memory_order_relaxed);
+    if (orig_seq_enableSensor && acc_h != -1) {
+        g_hijacked_accel_clock.store(true, std::memory_order_relaxed);
+        orig_seq_enableSensor(queue, acc_h, 0, 0, 0);
+    } else if (g_hw_accel != nullptr) {
+        g_hijacked_accel_clock.store(true, std::memory_order_relaxed);
+        ASensorEventQueue* nq = (ASensorEventQueue*)queue;
+        if (orig_registerSensor) orig_registerSensor(nq, g_hw_accel, 0, 0);
+        else if (orig_enableSensor) orig_enableSensor(nq, g_hw_accel);
+        if (orig_setEventRate) orig_setEventRate(nq, g_hw_accel, 0);
+    }
+}
+
+// Unified event processor for BOTH NDK (CODM) and Java/libsensor (BGMI) queues
+static ssize_t process_game_queue_events(void* queue, ASensorEvent* events, size_t count, ssize_t (*read_fn)(void*, ASensorEvent*, size_t)) {
+    ensure_sensor_thread_started();
 
     if (__builtin_expect(g_pending_synth && queue == g_gyro_queue.load(std::memory_order_relaxed) && count >= 1, 0)) {
         g_pending_synth = false;
@@ -443,7 +532,7 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
         }
     }
 
-    ssize_t n = orig_getEvents(queue, events, count);
+    ssize_t n = read_fn(queue, events, count);
     if (n <= 0) return n;
 
     const int state = own_state.load(std::memory_order_acquire);
@@ -451,7 +540,7 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
         const float wx = vg.out_x.load(std::memory_order_relaxed);
         const float wy = vg.out_y.load(std::memory_order_relaxed);
         const float wz = vg.out_z.load(std::memory_order_relaxed);
-        const bool is_gyro_q = (queue == g_gyro_queue.load(std::memory_order_relaxed));
+        bool is_gyro_q = (queue == g_gyro_queue.load(std::memory_order_relaxed));
         const bool game_wants_acc = g_game_wants_accel_on_gyro_q.load(std::memory_order_relaxed);
 
         bool emitted_gyro_in_batch = false;
@@ -462,17 +551,13 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
             if (e.timestamp > batch_ts) batch_ts = e.timestamp;
 
             if (e.type == ASENSOR_TYPE_GYROSCOPE || e.type == 4 || e.type == ASENSOR_TYPE_GYROSCOPE_UNCALIBRATED || e.type == 16) {
-                if (__builtin_expect(g_gyro_handle.load(std::memory_order_relaxed) == -1, 0)) {
-                    g_gyro_handle.store(e.sensor, std::memory_order_relaxed);
-                    g_gyro_type.store(e.type, std::memory_order_relaxed);
+                g_gyro_handle.store(e.sensor, std::memory_order_relaxed);
+                g_gyro_type.store(e.type, std::memory_order_relaxed);
+                if (!is_gyro_q) {
                     g_gyro_queue.store(queue, std::memory_order_relaxed);
+                    is_gyro_q = true;
                 }
-                if (__builtin_expect(!g_hijacked_accel_clock.load(std::memory_order_relaxed) && g_hw_accel != nullptr, 0)) {
-                    g_hijacked_accel_clock.store(true, std::memory_order_relaxed);
-                    if (orig_registerSensor) orig_registerSensor(queue, g_hw_accel, 0, 0);
-                    else if (orig_enableSensor) orig_enableSensor(queue, g_hw_accel);
-                    if (orig_setEventRate) orig_setEventRate(queue, g_hw_accel, 0);
-                }
+                hijack_accel_on_queue(queue);
 
                 write_synthetic_gyro(e, e.sensor, e.type, wx, wy, wz, e.timestamp);
                 emitted_gyro_in_batch = true;
@@ -520,13 +605,107 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
     return n;
 }
 
+// ---- 1. libsensor.so Hooks (Powers BGMI's Java SensorManager & low-level queues) ----
+static ssize_t call_orig_seq_read(void* q, ASensorEvent* ev, size_t c) {
+    return orig_seq_read(q, ev, c);
+}
+
+ssize_t hook_SensorEventQueue_read(void* queue, ASensorEvent* events, size_t count) {
+    if (queue == g_own_queue.load(std::memory_order_relaxed) || g_in_ndk_get_events) {
+        return orig_seq_read(queue, events, count);
+    }
+    return process_game_queue_events(queue, events, count, call_orig_seq_read);
+}
+
+int hook_SensorEventQueue_enableSensor(const void* queue, int32_t handle, int32_t /*us*/, int64_t /*maxBatch*/, int reservedFlags) {
+    if (queue == g_own_queue.load(std::memory_order_relaxed)) {
+        return orig_seq_enableSensor(queue, handle, 0, 0, reservedFlags);
+    }
+    ensure_sensor_thread_started();
+
+    if (handle == g_gyro4_handle.load(std::memory_order_relaxed)) {
+        g_gyro_handle.store(handle, std::memory_order_relaxed);
+        g_gyro_type.store(ASENSOR_TYPE_GYROSCOPE, std::memory_order_relaxed);
+        g_gyro_queue.store(const_cast<void*>(queue), std::memory_order_relaxed);
+    } else if (handle == g_gyro16_handle.load(std::memory_order_relaxed)) {
+        g_gyro_handle.store(handle, std::memory_order_relaxed);
+        g_gyro_type.store(ASENSOR_TYPE_GYROSCOPE_UNCALIBRATED, std::memory_order_relaxed);
+        g_gyro_queue.store(const_cast<void*>(queue), std::memory_order_relaxed);
+    } else if (handle == g_acc_handle.load(std::memory_order_relaxed)) {
+        if (queue == g_gyro_queue.load(std::memory_order_relaxed)) {
+            g_game_wants_accel_on_gyro_q.store(true, std::memory_order_relaxed);
+        }
+    }
+
+    int res = orig_seq_enableSensor(queue, handle, 0, 0, reservedFlags);
+    if (res >= 0 && queue == g_gyro_queue.load(std::memory_order_relaxed)) {
+        hijack_accel_on_queue(const_cast<void*>(queue));
+    }
+    return res;
+}
+
+int hook_SensorEventQueue_enableSensorPtr(const void* queue, const void* sensor, int32_t /*us*/) {
+    return orig_seq_enableSensorPtr(queue, sensor, 0);
+}
+
+int hook_SensorEventQueue_setEventRate(const void* queue, const void* sensor, int64_t /*ns*/) {
+    return orig_seq_setEventRate(queue, sensor, 0);
+}
+
+// ---- 2. Java JNI Hook (Refreshes float[] values right at dispatchSensorEvent in BGMI) ----
+void hook_CallVoidMethodV(JNIEnv* env, jobject obj, jmethodID methodID, va_list args) {
+    if (__builtin_expect(methodID == g_dispatchSensorEvent_mid && g_dispatchSensorEvent_mid != nullptr, 0)) {
+        ensure_sensor_thread_started();
+        va_list copy;
+        va_copy(copy, args);
+        jint handle = va_arg(copy, jint);
+        jfloatArray values = (jfloatArray)va_arg(copy, jobject);
+        va_end(copy);
+
+        if (values != nullptr && is_gyro_handle(handle)) {
+            float out[6] = {
+                vg.out_x.load(std::memory_order_relaxed),
+                vg.out_y.load(std::memory_order_relaxed),
+                vg.out_z.load(std::memory_order_relaxed),
+                0.0f, 0.0f, 0.0f
+            };
+            jsize len = env->GetArrayLength(values);
+            env->SetFloatArrayRegion(values, 0, len >= 6 ? 6 : (len >= 3 ? 3 : len), out);
+        }
+    }
+    orig_CallVoidMethodV(env, obj, methodID, args);
+}
+
+// ---- 3. NDK libandroid.so Hooks (Powers CODM) ----
+static ssize_t call_orig_ndk_getEvents(void* q, ASensorEvent* ev, size_t c) {
+    g_in_ndk_get_events = true;
+    ssize_t n = orig_getEvents((ASensorEventQueue*)q, ev, c);
+    g_in_ndk_get_events = false;
+    return n;
+}
+
+ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent* events, size_t count) {
+    if ((void*)queue == g_own_queue.load(std::memory_order_relaxed)) {
+        return orig_getEvents(queue, events, count);
+    }
+    return process_game_queue_events((void*)queue, events, count, call_orig_ndk_getEvents);
+}
+
 static void track_queue_subscription(ASensorEventQueue* queue, ASensor const* sensor) {
+    if ((void*)queue == g_own_queue.load(std::memory_order_relaxed)) return;
+    ensure_sensor_thread_started();
     if (!fn_getSensorType || !sensor) return;
     int type = fn_getSensorType(sensor);
+    int handle = fn_getSensorHandle ? fn_getSensorHandle(sensor) : -1;
     if (type == ASENSOR_TYPE_GYROSCOPE || type == 4 || type == ASENSOR_TYPE_GYROSCOPE_UNCALIBRATED || type == 16) {
-        g_gyro_queue.store(queue, std::memory_order_relaxed);
+        g_gyro_queue.store((void*)queue, std::memory_order_relaxed);
+        g_gyro_type.store(type, std::memory_order_relaxed);
+        if (handle != -1) g_gyro_handle.store(handle, std::memory_order_relaxed);
     } else if (type == ASENSOR_TYPE_ACCELEROMETER) {
-        if (queue == g_gyro_queue.load(std::memory_order_relaxed)) {
+        if (handle != -1 && g_acc_handle.load(std::memory_order_relaxed) == -1) {
+            g_acc_handle.store(handle, std::memory_order_relaxed);
+        }
+        if ((void*)queue == g_gyro_queue.load(std::memory_order_relaxed)) {
             g_game_wants_accel_on_gyro_q.store(true, std::memory_order_relaxed);
         }
     }
@@ -539,29 +718,76 @@ int hook_ASensorEventQueue_setEventRate(ASensorEventQueue* queue, ASensor const*
 
 int hook_ASensorEventQueue_registerSensor(ASensorEventQueue* queue, ASensor const* sensor, int32_t, int64_t) {
     track_queue_subscription(queue, sensor);
-    return orig_registerSensor(queue, sensor, 0, 0);
+    int res = orig_registerSensor(queue, sensor, 0, 0);
+    if (res >= 0 && (void*)queue == g_gyro_queue.load(std::memory_order_relaxed)) {
+        hijack_accel_on_queue((void*)queue);
+    }
+    return res;
 }
 
 int hook_ASensorEventQueue_enableSensor(ASensorEventQueue* queue, ASensor const* sensor) {
     track_queue_subscription(queue, sensor);
     int res = orig_enableSensor(queue, sensor);
     if (res >= 0 && orig_setEventRate) orig_setEventRate(queue, sensor, 0);
+    if (res >= 0 && (void*)queue == g_gyro_queue.load(std::memory_order_relaxed)) {
+        hijack_accel_on_queue((void*)queue);
+    }
     return res;
 }
 
-void install_hook() {
-    void* libandroid = dlopen("libandroid.so", RTLD_NOW);
-    if (!libandroid) return;
-    fn_getSensorType  = (getSensorType_t)dlsym(libandroid, "ASensor_getType");
-    void* target_get  = dlsym(libandroid, "ASensorEventQueue_getEvents");
-    void* target_rate = dlsym(libandroid, "ASensorEventQueue_setEventRate");
-    void* target_reg  = dlsym(libandroid, "ASensorEventQueue_registerSensor");
-    void* target_en   = dlsym(libandroid, "ASensorEventQueue_enableSensor");
+void install_hook(JNIEnv* env) {
+    // 1. Hook Java SystemSensorManager$SensorEventQueue.dispatchSensorEvent via JNIEnv
+    if (env) {
+        jclass seqCls = env->FindClass("android/hardware/SystemSensorManager$SensorEventQueue");
+        if (seqCls) {
+            g_dispatchSensorEvent_mid = env->GetMethodID(seqCls, "dispatchSensorEvent", "(I[FIJ)V");
+            env->DeleteLocalRef(seqCls);
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
 
-    if (target_get)  DobbyHook(target_get,  (dobby_dummy_func_t)hook_ASensorEventQueue_getEvents,      (dobby_dummy_func_t*)&orig_getEvents);
-    if (target_rate) DobbyHook(target_rate, (dobby_dummy_func_t)hook_ASensorEventQueue_setEventRate,   (dobby_dummy_func_t*)&orig_setEventRate);
-    if (target_reg)  DobbyHook(target_reg,  (dobby_dummy_func_t)hook_ASensorEventQueue_registerSensor, (dobby_dummy_func_t*)&orig_registerSensor);
-    if (target_en)   DobbyHook(target_en,   (dobby_dummy_func_t)hook_ASensorEventQueue_enableSensor,   (dobby_dummy_func_t*)&orig_enableSensor);
+        if (g_dispatchSensorEvent_mid && env->functions && env->functions->CallVoidMethodV) {
+            DobbyHook((void*)env->functions->CallVoidMethodV,
+                      (dobby_dummy_func_t)hook_CallVoidMethodV,
+                      (dobby_dummy_func_t*)&orig_CallVoidMethodV);
+        }
+    }
+
+    // 2. Hook libsensor.so (Underlying C++ SensorEventQueue used by Java SensorManager in BGMI)
+    void* libsensor = dlopen("libsensor.so", RTLD_NOW);
+    if (libsensor) {
+        void* seq_read = dlsym(libsensor, "_ZN7android16SensorEventQueue4readEP12ASensorEventm");
+        if (!seq_read) seq_read = dlsym(libsensor, "_ZN7android16SensorEventQueue4readEP12ASensorEventj");
+
+        void* seq_en = dlsym(libsensor, "_ZNK7android16SensorEventQueue12enableSensorEiiili");
+        if (!seq_en) seq_en = dlsym(libsensor, "_ZNK7android16SensorEventQueue12enableSensorEiiixi");
+        if (!seq_en) seq_en = dlsym(libsensor, "_ZNK7android16SensorEventQueue12enableSensorEiiil");
+
+        void* seq_en_ptr = dlsym(libsensor, "_ZNK7android16SensorEventQueue12enableSensorEPKNS_6SensorEi");
+
+        void* seq_rate = dlsym(libsensor, "_ZNK7android16SensorEventQueue12setEventRateEPKNS_6SensorEl");
+        if (!seq_rate) seq_rate = dlsym(libsensor, "_ZNK7android16SensorEventQueue12setEventRateEPKNS_6SensorEx");
+
+        if (seq_read)   DobbyHook(seq_read,   (dobby_dummy_func_t)hook_SensorEventQueue_read,            (dobby_dummy_func_t*)&orig_seq_read);
+        if (seq_en)     DobbyHook(seq_en,     (dobby_dummy_func_t)hook_SensorEventQueue_enableSensor,    (dobby_dummy_func_t*)&orig_seq_enableSensor);
+        if (seq_en_ptr) DobbyHook(seq_en_ptr, (dobby_dummy_func_t)hook_SensorEventQueue_enableSensorPtr, (dobby_dummy_func_t*)&orig_seq_enableSensorPtr);
+        if (seq_rate)   DobbyHook(seq_rate,   (dobby_dummy_func_t)hook_SensorEventQueue_setEventRate,    (dobby_dummy_func_t*)&orig_seq_setEventRate);
+    }
+
+    // 3. Hook libandroid.so (NDK ASensorEventQueue used by CODM)
+    void* libandroid = dlopen("libandroid.so", RTLD_NOW);
+    if (libandroid) {
+        fn_getSensorType   = (getSensorType_t)dlsym(libandroid, "ASensor_getType");
+        fn_getSensorHandle = (getSensorHandle_t)dlsym(libandroid, "ASensor_getHandle");
+        void* target_get   = dlsym(libandroid, "ASensorEventQueue_getEvents");
+        void* target_rate  = dlsym(libandroid, "ASensorEventQueue_setEventRate");
+        void* target_reg   = dlsym(libandroid, "ASensorEventQueue_registerSensor");
+        void* target_en    = dlsym(libandroid, "ASensorEventQueue_enableSensor");
+
+        if (target_get)  DobbyHook(target_get,  (dobby_dummy_func_t)hook_ASensorEventQueue_getEvents,      (dobby_dummy_func_t*)&orig_getEvents);
+        if (target_rate) DobbyHook(target_rate, (dobby_dummy_func_t)hook_ASensorEventQueue_setEventRate,   (dobby_dummy_func_t*)&orig_setEventRate);
+        if (target_reg)  DobbyHook(target_reg,  (dobby_dummy_func_t)hook_ASensorEventQueue_registerSensor, (dobby_dummy_func_t*)&orig_registerSensor);
+        if (target_en)   DobbyHook(target_en,   (dobby_dummy_func_t)hook_ASensorEventQueue_enableSensor,   (dobby_dummy_func_t*)&orig_enableSensor);
+    }
 }
 
 class GyroModifier : public zygisk::ModuleBase {
@@ -575,7 +801,10 @@ public:
             "com.garena.game.codm",
             "com.tencent.tmgp.cod",
             "com.tencent.ig",
-            "com.pubg.imobile"
+            "com.pubg.imobile",
+            "com.pubg.krmobile",
+            "com.vng.pubgmobile",
+            "com.rekoo.pubgm"
         };
         for (const char* t : targets) {
             if (strcmp(process, t) == 0) { enable_hack = true; break; }
@@ -583,7 +812,7 @@ public:
         env->ReleaseStringUTFChars(args->nice_name, process);
     }
     void postAppSpecialize(const zygisk::AppSpecializeArgs*) override {
-        if (enable_hack) install_hook();
+        if (enable_hack) install_hook(env);
     }
 private:
     zygisk::Api* api = nullptr;
