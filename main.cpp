@@ -69,7 +69,7 @@ static inline real soft_gate(real dev, real tol) { real x = dev / tol; return x 
 
 struct Params {
     real sigma_tilt  = 0.02;
-    real sigma_head  = 0.02;
+    real sigma_head  = 0.06;
     real hand_acc    = 100.0;
     real g_tol       = 70.0;
     real mag_tol     = 10.0;
@@ -203,8 +203,8 @@ private:
         real lam = dyn_acc * T * T / sigma_meas;
         real r = (4.0 + lam - sqrt(8.0 * lam + lam * lam)) * 0.25;
 
-        real max_alpha = 0.90 + 0.10 * activity;
-        real max_beta  = 0.85 + 0.15 * activity;
+        real max_alpha = 0.80 + 0.20 * activity;
+        real max_beta  = 0.75 + 0.15 * activity;
         real alpha = fmin(1.0 - r * r, max_alpha);
         real beta  = fmin(fmax(2.0 * (1.0 + r * r) - 4.0 * r, 0.0), max_beta);
 
