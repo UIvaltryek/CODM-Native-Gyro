@@ -69,9 +69,9 @@ static inline real soft_gate(real dev, real tol) { real x = dev / tol; return x 
 
 struct Params {
     real sigma_tilt  = 0.04;
-    real sigma_head  = 0.08;
-    real hand_acc    = 80.0;
-    real g_tol       = 35.0;
+    real sigma_head  = 0.04;
+    real hand_acc    = 135.0;
+    real g_tol       = 70.0;
     real mag_tol     = 10.0;
     real dip_tol     = 3.14159;
     real jump_reject = 3.14159;
@@ -203,8 +203,8 @@ private:
         real lam = dyn_acc * T * T / sigma_meas;
         real r = (4.0 + lam - sqrt(8.0 * lam + lam * lam)) * 0.25;
 
-        real max_alpha = 0.80 + 0.20 * activity;
-        real max_beta  = 0.75 + 0.15 * activity;
+        real max_alpha = 0.85 + 0.10 * activity;
+        real max_beta  = 0.70 + 0.22 * activity;
         real alpha = fmin(1.0 - r * r, max_alpha);
         real beta  = fmin(fmax(2.0 * (1.0 + r * r) - 4.0 * r, 0.0), max_beta);
 
@@ -269,9 +269,7 @@ private:
 // DUAL PIPELINE: NDK (CODM) & LIBSENSOR/JAVA (BGMI)
 // =====================================================================================================
 
-static constexpr float HARD_IRON_X = 93.76f;
-static constexpr float HARD_IRON_Y = -29.09f;
-static constexpr float HARD_IRON_Z = 967.01f;
+// Calibrated magnetometer (type 2) is used everywhere; hard-iron offsets are no longer applied.
 
 static gl::VirtualGyro vg;
 static std::mutex vg_lock;
@@ -331,11 +329,6 @@ static thread_local bool g_in_ndk_call = false;
 
 static inline void feed_accel(const ASensorEvent& e) {
     vg.on_accel({e.acceleration.x, e.acceleration.y, e.acceleration.z}, e.timestamp);
-}
-static inline void feed_mag_uncal(const ASensorEvent& e) {
-    vg.on_mag({e.uncalibrated_magnetic.x_uncalib - HARD_IRON_X,
-               e.uncalibrated_magnetic.y_uncalib - HARD_IRON_Y,
-               e.uncalibrated_magnetic.z_uncalib - HARD_IRON_Z}, e.timestamp);
 }
 static inline void feed_mag_cal(const ASensorEvent& e) {
     vg.on_mag({e.magnetic.x, e.magnetic.y, e.magnetic.z}, e.timestamp);
@@ -433,9 +426,8 @@ static void* sensor_thread_main(void*) {
     ASensorEventQueue* q = looper ? createEventQueue(mgr, looper, VG_LOOPER_ID, nullptr, nullptr) : nullptr;
     const ASensor* acc = getDefaultSensor(mgr, ASENSOR_TYPE_ACCELEROMETER);
     g_hw_accel = acc;
-    int mag_type = 14;
-    const ASensor* mag = getDefaultSensor(mgr, 14);
-    if (!mag) { mag_type = 2; mag = getDefaultSensor(mgr, 2); }
+    // Calibrated magnetic field (type 2) only
+    const ASensor* mag = getDefaultSensor(mgr, ASENSOR_TYPE_MAGNETIC_FIELD);
     if (!q || !acc || !mag) { own_state.store(-1, std::memory_order_relaxed); return nullptr; }
 
     if (registerSensor) {
@@ -469,9 +461,7 @@ static void* sensor_thread_main(void*) {
                         g_acc_handle.store(ev[i].sensor, std::memory_order_relaxed);
                     }
                     feed_accel(ev[i]);
-                } else if (mag_type == 14 && ev[i].type == 14) {
-                    feed_mag_uncal(ev[i]);
-                } else if (mag_type == 2 && ev[i].type == 2) {
+                } else if (ev[i].type == ASENSOR_TYPE_MAGNETIC_FIELD) {
                     feed_mag_cal(ev[i]);
                 }
             }
@@ -579,8 +569,8 @@ ssize_t hook_ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent*
         ASensorEvent& e = events[i];
         if (e.type == ASENSOR_TYPE_ACCELEROMETER) {
             feed_accel(e);
-        } else if (e.type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || e.type == 14) {
-            feed_mag_uncal(e);
+        } else if (e.type == ASENSOR_TYPE_MAGNETIC_FIELD) {
+            feed_mag_cal(e);
         } else if (e.type == ASENSOR_TYPE_GYROSCOPE || e.type == 4 || e.type == ASENSOR_TYPE_GYROSCOPE_UNCALIBRATED || e.type == 16) {
             const float wx = vg.out_x.load(std::memory_order_relaxed);
             const float wy = vg.out_y.load(std::memory_order_relaxed);
@@ -717,8 +707,8 @@ ssize_t hook_SensorEventQueue_read(void* queue, ASensorEvent* events, size_t cou
         ASensorEvent& e = events[i];
         if (e.type == ASENSOR_TYPE_ACCELEROMETER) {
             feed_accel(e);
-        } else if (e.type == ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED || e.type == 14) {
-            feed_mag_uncal(e);
+        } else if (e.type == ASENSOR_TYPE_MAGNETIC_FIELD) {
+            feed_mag_cal(e);
         } else if (e.type == ASENSOR_TYPE_GYROSCOPE || e.type == 4 || e.type == ASENSOR_TYPE_GYROSCOPE_UNCALIBRATED || e.type == 16) {
             const float wx = vg.out_x.load(std::memory_order_relaxed);
             const float wy = vg.out_y.load(std::memory_order_relaxed);
